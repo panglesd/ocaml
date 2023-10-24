@@ -15,8 +15,6 @@
 (*                                                                        *)
 (**************************************************************************)
 
-[@@@ocaml.warning "+a-4-30-40-41-42"]
-
 open! Dynlink_compilerlibs
 
 module DC = Dynlink_common
@@ -70,7 +68,7 @@ module Bytecode = struct
   let adapt_filename f = f
 
   let num_globals_inited () =
-    Misc.fatal_error "Should never be called for bytecode dynlink"
+    failwith "Should never be called for bytecode dynlink"
 
   let fold_initial_units ~init ~f =
     List.fold_left (fun acc (compunit, interface) ->
@@ -99,18 +97,21 @@ module Bytecode = struct
     Fun.protect f
       ~finally:(fun () -> Mutex.unlock lock)
 
+  let really_input_bigarray ic ar st n =
+    match In_channel.really_input_bigarray ic ar st n with
+      | None -> raise End_of_file
+      | Some () -> ()
+
   let run lock (ic, file_name, file_digest) ~unit_header ~priv =
-    let open Misc in
     let clos = with_lock lock (fun () ->
         let old_state = Symtable.current_state () in
         let compunit : Cmo_format.compilation_unit = unit_header in
         seek_in ic compunit.cu_pos;
-        let code_size = compunit.cu_codesize + 8 in
-        let code = LongString.create code_size in
-        LongString.input_bytes_into code ic compunit.cu_codesize;
-        LongString.set code compunit.cu_codesize (Char.chr Opcodes.opRETURN);
-        LongString.blit_string "\000\000\000\001\000\000\000" 0
-          code (compunit.cu_codesize + 1) 7;
+        let code =
+          Bigarray.Array1.create Bigarray.Char Bigarray.c_layout
+            compunit.cu_codesize
+        in
+        really_input_bigarray ic code 0 compunit.cu_codesize;
         begin try
           Symtable.patch_object code compunit.cu_reloc;
           Symtable.check_global_initialized compunit.cu_reloc;

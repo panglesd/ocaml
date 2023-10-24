@@ -53,17 +53,16 @@ extern caml_generated_constant
 
 /* Exception raising */
 
-extern CAMLnoret
+CAMLnoret extern
 void caml_raise_exception (caml_domain_state* state, value bucket);
 
 void caml_raise(value v)
 {
   Caml_check_caml_state();
   char* exception_pointer;
-
-  Unlock_exn();
-
   CAMLassert(!Is_exception_result(v));
+
+  caml_channel_cleanup_on_raise();
 
   // avoid calling caml_raise recursively
   v = caml_process_pending_actions_with_root_exn(v);

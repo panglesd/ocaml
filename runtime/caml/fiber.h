@@ -61,8 +61,6 @@ struct stack_info {
   int64_t id;
 };
 
-CAML_STATIC_ASSERT(sizeof(struct stack_info) ==
-                   Stack_ctx_words * sizeof(value));
 #define Stack_base(stk) ((value*)(stk + 1))
 #define Stack_threshold_ptr(stk) \
   (Stack_base(stk) + Stack_threshold / sizeof(value))
@@ -281,9 +279,9 @@ value caml_continuation_use (value cont);
    Used for cloning continuations and continuation backtraces. */
 void caml_continuation_replace(value cont, struct stack_info* stack);
 
-CAMLextern CAMLnoret void caml_raise_continuation_already_resumed (void);
+CAMLnoret CAMLextern void caml_raise_continuation_already_resumed (void);
 
-CAMLextern CAMLnoret void caml_raise_unhandled_effect (value effect);
+CAMLnoret CAMLextern void caml_raise_unhandled_effect (value effect);
 
 value caml_make_unhandled_effect_exn (value effect);
 

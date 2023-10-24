@@ -34,6 +34,11 @@ INSTALL_PROG ?= @INSTALL_PROGRAM@
 build_ocamldebug = @build_ocamldebug@
 
 build_ocamldoc = @build_ocamldoc@
+build_libraries_manpages = @build_libraries_manpages@
+
+OCAMLDOC_TARGET = @ocamldoc_target@
+
+OCAMLDOC_OPT_TARGET = @ocamldoc_opt_target@
 
 build_ocamltex = @build_ocamltex@
 
@@ -103,10 +108,8 @@ PACKAGE_TARNAME = @PACKAGE_TARNAME@
 datarootdir = @datarootdir@
 DOCDIR=@docdir@
 
-ocamltest_unix_impl = @ocamltest_unix_impl@
-ocamltest_unix_name = @ocamltest_unix_name@
-ocamltest_unix_path = @ocamltest_unix_path@
-ocamltest_unix_include = @ocamltest_unix_include@$(EMPTY)
+unix_directory = @unix_directory@
+unix_library = @unix_library@
 
 # Which make target to build, depending on whether the native compiler
 # has been enabled or not during the configuration stage
@@ -152,6 +155,9 @@ runtime_ASM_OBJECTS = $(addprefix runtime/,@runtime_asm_objects@)
 
 # Platform-dependent module for ocamlyacc
 ocamlyacc_WSTR_MODULE = @ocamlyacc_wstr_module@
+
+# Architecture-specific modules, if any
+arch_specific_SOURCES = @arch_specific_SOURCES@
 
 # ThreadSanitizer support enabled
 TSAN=@tsan@

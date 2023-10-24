@@ -40,8 +40,8 @@ let rec loadfiles ppf name =
     Dynlink.loadfile filename;
     let d = Filename.dirname name in
     if d <> Filename.current_dir_name then begin
-      if not (List.mem d (Load_path.get_paths ())) then
-        Load_path.add_dir d;
+      if not (List.mem d (Load_path.get_path_list ())) then
+        Load_path.add_dir ~hidden:false d;
     end;
     fprintf ppf "File %s loaded@."
       (if d <> Filename.current_dir_name then
@@ -51,7 +51,7 @@ let rec loadfiles ppf name =
     true
   with
   | Dynlink.Error (Dynlink.Unavailable_unit unit) ->
-      loadfiles ppf (String.uncapitalize_ascii unit ^ ".cmo")
+      loadfiles ppf (Unit_info.normalize unit ^ ".cmo")
         &&
       loadfiles ppf name
   | Not_found ->

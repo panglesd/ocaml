@@ -152,7 +152,7 @@ let rec expr_size env = function
   | Uletrec(bindings, body) ->
       let env =
         List.fold_right
-          (fun (id, exp) env -> V.add (VP.var id) (expr_size env exp) env)
+          (fun (id, _, exp) env -> V.add (VP.var id) (expr_size env exp) env)
           bindings env
       in
       expr_size env body
@@ -221,6 +221,11 @@ let rec expr_size env = function
   | Uconst _ | Udirect_apply _ | Ugeneric_apply _ | Uwhile _ | Ufor _
   | Uassign _ | Usend _ -> RHS_nonrec
   | Uunreachable -> RHS_unreachable
+
+let expr_size_of_binding (clas : Typedtree.recursive_binding_kind) expr =
+  match clas with
+  | Not_recursive -> RHS_nonrec
+  | Static -> expr_size V.empty expr
 
 (* Translate structured constants to Cmm data items *)
 
@@ -575,6 +580,14 @@ let rec transl env e =
           tag_int (Cop(mk_load_mut Word_int,
             [field_address (transl env b) dim_ofs dbg],
             dbg)) dbg
+      | (Pintcomp _ as comp,
+         [Uprim(Pcompare_ints, [arg1; arg2], _);
+          Uconst(Uconst_int 0)]) ->
+          transl env (Uprim (comp, [arg1; arg2], dbg))
+      | (Pintcomp comp,
+         [Uprim(Pcompare_bints b, [arg1; arg2], _);
+          Uconst(Uconst_int 0)]) ->
+          transl env (Uprim (Pbintcomp (b, comp), [arg1; arg2], dbg))
       | (p, [arg]) ->
           transl_prim_1 env p arg dbg
       | (p, [arg1; arg2]) ->
@@ -814,7 +827,7 @@ and transl_ccall env prim args dbg =
           | Pint32 -> XInt32
           | Pint64 -> XInt64 in
         (xty, transl_unbox_int dbg env bi arg)
-    | Untagged_int ->
+    | Untagged_immediate ->
         (XInt, untag_int (transl env arg) dbg)
   in
   let rec transl_args native_repr_args args =
@@ -835,7 +848,7 @@ and transl_ccall env prim args dbg =
     | Same_as_ocaml_repr -> (typ_val, fun x -> x)
     | Unboxed_float -> (typ_float, box_float dbg)
     | Unboxed_integer bi -> (typ_int, box_int dbg bi)
-    | Untagged_int -> (typ_int, (fun i -> tag_int i dbg))
+    | Untagged_immediate -> (typ_int, (fun i -> tag_int i dbg))
   in
   let typ_args, args = transl_args prim.prim_native_repr_args args in
   wrap_result
@@ -1425,7 +1438,7 @@ and transl_switch dbg env arg index cases = match Array.length cases with
 and transl_letrec env bindings cont =
   let dbg = Debuginfo.none in
   let bsz =
-    List.map (fun (id, exp) -> (id, exp, expr_size V.empty exp))
+    List.map (fun (id, clas, exp) -> (id, exp, expr_size_of_binding clas exp))
       bindings
   in
   let op_alloc prim args =

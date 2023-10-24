@@ -272,6 +272,11 @@ type function_attribute = {
   is_a_functor: bool;
   stub: bool;
   tmc_candidate: bool;
+  (* [simplif.ml] (in the `simplif` function within `simplify_lets`) attempts to
+     fuse nested functions, rewriting e.g. [fun x -> fun y -> e] to
+     [fun x y -> e]. This fusion is allowed only when the [may_fuse_arity] field
+     on *both* functions involved is [true]. *)
+  may_fuse_arity: bool;
 }
 
 type scoped_location = Debuginfo.Scoped_location.t
@@ -284,7 +289,7 @@ type lambda =
   | Lfunction of lfunction
   | Llet of let_kind * value_kind * Ident.t * lambda * lambda
   | Lmutlet of value_kind * Ident.t * lambda * lambda
-  | Lletrec of (Ident.t * lambda) list * lambda
+  | Lletrec of rec_binding list * lambda
   | Lprim of primitive * lambda list * scoped_location
   | Lswitch of lambda * lambda_switch * scoped_location
 (* switch on strings, clauses are sorted by string order,
@@ -304,6 +309,12 @@ type lambda =
   | Lsend of meth_kind * lambda * lambda * lambda list * scoped_location
   | Levent of lambda * lambda_event
   | Lifused of Ident.t * lambda
+
+and rec_binding = {
+  id : Ident.t;
+  rkind : Typedtree.recursive_binding_kind;
+  def : lambda;
+}
 
 and lfunction = private
   { kind: function_kind;

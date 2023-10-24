@@ -694,9 +694,12 @@ let check_shadowing env = function
   | `Label (Some (l1, l2))
     when not (!same_constr env l1.lbl_res l2.lbl_res) ->
       Some "label"
-  | `Value (Some _) -> Some "value"
+  | `Value (Some (Val_unbound _, _)) -> None
+  | `Value (Some (_, _)) -> Some "value"
   | `Type (Some _) -> Some "type"
-  | `Module (Some _) | `Component (Some _) -> Some "module"
+  | `Module (Some (Mod_unbound _, _)) -> None
+  | `Module (Some _) | `Component (Some _) ->
+      Some "module"
   | `Module_type (Some _) -> Some "module type"
   | `Class (Some _) -> Some "class"
   | `Class_type (Some _) -> Some "class type"
@@ -934,8 +937,8 @@ let imports () = Persistent_env.imports !persistent_env
 let import_crcs ~source crcs =
   Persistent_env.import_crcs !persistent_env ~source crcs
 
-let read_pers_mod modname filename =
-  Persistent_env.read !persistent_env read_sign_of_cmi modname filename
+let read_pers_mod cmi =
+  Persistent_env.read !persistent_env read_sign_of_cmi cmi
 
 let find_pers_mod name =
   Persistent_env.find !persistent_env read_sign_of_cmi name
@@ -1025,7 +1028,7 @@ let find_ident_module id env =
   match find_same_module id env.modules with
   | Mod_local data -> data
   | Mod_unbound _ -> raise Not_found
-  | Mod_persistent -> find_pers_mod (Ident.name id)
+  | Mod_persistent -> find_pers_mod ~allow_hidden:true (Ident.name id)
 
 let rec find_module_components path env =
   match path with
@@ -1133,7 +1136,7 @@ let rec find_type_data path env =
   | decl ->
     {
       tda_declaration = decl;
-      tda_descriptions = Type_abstract Abstract_def;
+      tda_descriptions = Type_abstract (Btype.type_origin decl);
       tda_shape = Shape.leaf decl.type_uid;
     }
   | exception Not_found -> begin
@@ -2021,7 +2024,7 @@ and store_type_infos ~tda_shape id info env =
   let tda =
     {
       tda_declaration = info;
-      tda_descriptions = Type_abstract Abstract_def;
+      tda_descriptions = Type_abstract (Btype.type_origin info);
       tda_shape
     }
   in
@@ -2506,29 +2509,20 @@ let open_signature
   else open_signature None root env
 
 (* Read a signature from a file *)
-let read_signature modname filename =
-  let mda = read_pers_mod modname filename in
+let read_signature u =
+  let mda = read_pers_mod u in
   let md = Subst.Lazy.force_module_decl mda.mda_declaration in
   match md.md_type with
   | Mty_signature sg -> sg
   | Mty_ident _ | Mty_functor _ | Mty_alias _ -> assert false
 
-let is_identchar_latin1 = function
-  | 'A'..'Z' | 'a'..'z' | '_' | '\192'..'\214' | '\216'..'\246'
-  | '\248'..'\255' | '\'' | '0'..'9' -> true
-  | _ -> false
 
 let unit_name_of_filename fn =
   match Filename.extension fn with
-  | ".cmi" -> begin
-      let unit =
-        String.capitalize_ascii (Filename.remove_extension fn)
-      in
-      if String.for_all is_identchar_latin1 unit then
-        Some unit
-      else
-        None
-    end
+  | ".cmi" ->
+      let modname = Unit_info.modname_from_source fn in
+      if Unit_info.is_unit_name modname then Some modname
+      else None
   | _ -> None
 
 let persistent_structures_of_dir dir =
@@ -2538,27 +2532,28 @@ let persistent_structures_of_dir dir =
   |> String.Set.of_seq
 
 (* Save a signature to a file *)
-let save_signature_with_transform cmi_transform ~alerts sg modname filename =
+let save_signature_with_transform cmi_transform ~alerts sg cmi_info =
   Btype.cleanup_abbrev ();
   Subst.reset_for_saving ();
   let sg = Subst.signature Make_local (Subst.for_saving Subst.identity) sg in
   let cmi =
-    Persistent_env.make_cmi !persistent_env modname sg alerts
+    Persistent_env.make_cmi !persistent_env
+      (Unit_info.Artifact.modname cmi_info) sg alerts
     |> cmi_transform in
-  let pm = save_sign_of_cmi
-      { Persistent_env.Persistent_signature.cmi; filename } in
-  Persistent_env.save_cmi !persistent_env
-    { Persistent_env.Persistent_signature.filename; cmi } pm;
+  let filename = Unit_info.Artifact.filename cmi_info in
+  let pers_sig =
+    Persistent_env.Persistent_signature.{ cmi; filename; visibility = Visible }
+  in
+  let pm = save_sign_of_cmi pers_sig in
+  Persistent_env.save_cmi !persistent_env pers_sig pm;
   cmi
 
-let save_signature ~alerts sg modname filename =
-  save_signature_with_transform (fun cmi -> cmi)
-    ~alerts sg modname filename
+let save_signature ~alerts sg cmi =
+  save_signature_with_transform (fun cmi -> cmi) ~alerts sg cmi
 
-let save_signature_with_imports ~alerts sg modname filename imports =
+let save_signature_with_imports ~alerts sg cmi imports =
   let with_imports cmi = { cmi with cmi_crcs = imports } in
-  save_signature_with_transform with_imports
-    ~alerts sg modname filename
+  save_signature_with_transform with_imports ~alerts sg cmi
 
 (* Make the initial environment *)
 let initial =
@@ -2770,10 +2765,10 @@ let lookup_ident_module (type a) (load : a load) ~errors ~use ~loc s env =
   | Mod_persistent -> begin
       match load with
       | Don't_load ->
-          check_pers_mod ~loc s;
+          check_pers_mod ~allow_hidden:false ~loc s;
           path, (() : a)
       | Load -> begin
-          match find_pers_mod s with
+          match find_pers_mod ~allow_hidden:false s with
           | mda ->
               use_module ~use ~loc path mda;
               path, (mda : a)
@@ -3278,7 +3273,7 @@ let bound_module name env =
   | exception Not_found ->
       if Current_unit_name.is name then false
       else begin
-        match find_pers_mod name with
+        match find_pers_mod ~allow_hidden:false name with
         | _ -> true
         | exception Not_found -> false
       end

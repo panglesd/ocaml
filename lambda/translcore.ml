@@ -120,6 +120,11 @@ let assert_failed loc ~scopes exp =
                Const_base(Const_int line);
                Const_base(Const_int char)]))], loc))], loc)
 
+(* In cases where we're careful to preserve syntactic arity, we disable
+   the arity fusion attempted by simplif.ml *)
+let function_attribute_disallowing_arity_fusion =
+  { default_function_attribute with may_fuse_arity = false }
+
 let rec cut n l =
   if n = 0 then ([],l) else
   match l with [] -> failwith "Translcore.cut"
@@ -524,7 +529,11 @@ and transl_exp0 ~in_new_scope ~scopes e =
          let fn = lfunction ~kind:Curried
                             ~params:[Ident.create_local "param", Pgenval]
                             ~return:Pgenval
-                            ~attr:default_function_attribute
+                            (* The translation of [e] may be a function, in
+                               which case disallowing arity fusion gives a very
+                               small performance improvement.
+                            *)
+                            ~attr:function_attribute_disallowing_arity_fusion
                             ~loc:(of_location ~scopes e.exp_loc)
                             ~body:(transl_exp ~scopes e) in
           Lprim(Pmakeblock(Config.lazy_tag, Mutable, None), [fn],
@@ -831,7 +840,7 @@ and transl_curried_function ~scopes loc return repr params body =
       let body, return =
         List.fold_right
           (fun chunk (body, return) ->
-            let attr = default_function_attribute in
+            let attr = function_attribute_disallowing_arity_fusion in
             let loc = of_location ~scopes loc in
             let body =
               lfunction ~kind:Curried ~params:chunk ~return ~body ~attr ~loc
@@ -852,7 +861,7 @@ and transl_function ~scopes e params body =
          let params, body = fuse_method_arity params body in
          transl_function_without_attributes ~scopes e.exp_loc repr params body)
   in
-  let attr = default_function_attribute in
+  let attr = function_attribute_disallowing_arity_fusion in
   let loc = of_location ~scopes e.exp_loc in
   let lam = lfunction ~kind ~params ~return ~body ~attr ~loc in
   let attrs =
@@ -897,7 +906,8 @@ and transl_let ~scopes ?(in_structure=false) rec_flag pat_expr_list =
       let rec transl = function
         [] ->
           fun body -> body
-      | {vb_pat=pat; vb_expr=expr; vb_attributes=attr; vb_loc} :: rem ->
+      | {vb_pat=pat; vb_expr=expr; vb_rec_kind=_; vb_attributes=attr; vb_loc}
+        :: rem ->
           let lam = transl_bound_exp ~scopes ~in_structure pat expr in
           let lam = Translattribute.add_function_attributes lam vb_loc attr in
           let mk_body = transl rem in
@@ -912,12 +922,13 @@ and transl_let ~scopes ?(in_structure=false) rec_flag pat_expr_list =
             | Tpat_alias ({pat_desc=Tpat_any}, id,_) -> id
             | _ -> assert false)
         pat_expr_list in
-      let transl_case {vb_expr=expr; vb_attributes; vb_loc; vb_pat} id =
-        let lam = transl_bound_exp ~scopes ~in_structure vb_pat expr in
-        let lam =
-          Translattribute.add_function_attributes lam vb_loc vb_attributes
+      let transl_case {vb_expr=expr; vb_attributes; vb_rec_kind = rkind;
+                       vb_loc; vb_pat} id =
+        let def = transl_bound_exp ~scopes ~in_structure vb_pat expr in
+        let def =
+          Translattribute.add_function_attributes def vb_loc vb_attributes
         in
-        (id, lam) in
+        { id; rkind; def } in
       let lam_bds = List.map2 transl_case pat_expr_list idlist in
       fun body -> Lletrec(lam_bds, body)
 
@@ -1173,7 +1184,7 @@ and transl_letop ~scopes loc env let_ ands param case partial =
                 { cases = [case]; param; partial; loc = ghost_loc;
                   exp_extra = None; attributes = []; }))
     in
-    let attr = default_function_attribute in
+    let attr = function_attribute_disallowing_arity_fusion in
     let loc = of_location ~scopes case.c_rhs.exp_loc in
     lfunction ~kind ~params ~return ~body ~attr ~loc
   in

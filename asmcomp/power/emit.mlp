@@ -31,9 +31,12 @@ let reserved_stack_space = 32
 (* Layout of the stack.  The stack is kept 16-aligned. *)
 
 let initial_stack_offset f =
-  reserved_stack_space +                    (* Including the return address *)
-  size_int * f.fun_num_stack_slots.(0) +    (* Local int variables *)
-  size_float * f.fun_num_stack_slots.(1)    (* Local float variables *)
+  if f.fun_frame_required then
+    reserved_stack_space +                    (* Including the return address *)
+    size_int * f.fun_num_stack_slots.(0) +    (* Local int variables *)
+    size_float * f.fun_num_stack_slots.(1)    (* Local float variables *)
+  else
+    0
 
 let frame_size env =
   let size =
@@ -271,7 +274,7 @@ let adjust_stack_offset env delta =
 
 (* Record live pointers at call points *)
 
-let record_frame env live dbg =
+let record_frame_label env live dbg =
   let lbl = new_label() in
   let live_offset = ref [] in
   Reg.Set.iter
@@ -286,6 +289,10 @@ let record_frame env live dbg =
     live;
   record_frame_descr ~label:lbl ~frame_size:(frame_size env)
     ~live_offset:!live_offset dbg;
+  lbl
+
+let record_frame env live dbg =
+  let lbl = record_frame_label env live dbg in
   `{emit_label lbl}:\n`
 
 (* Names for conditional branches after comparisons *)
@@ -359,8 +366,11 @@ module BR = Branch_relaxation.Make (struct
     let classify_instr = function
       | Lop (Ialloc _)
       | Lop (Ipoll _)
-      (* [Ialloc_far] does not need to be here, since its code sequence
-         never involves any conditional branches that might need relaxing. *)
+      | Lop (Iintop Icheckbound)
+      | Lop (Iintop_imm (Icheckbound, _))
+      (* The various "far" variants in [specific_operation] don't need to
+         return [Some] here, since their code sequences never contain any
+         conditional branches that might need relaxing. *)
       | Lcondbranch _
       | Lcondbranch3 _ -> Some Branch
       | _ -> None
@@ -368,12 +378,8 @@ module BR = Branch_relaxation.Make (struct
 
   let offset_pc_at_branch = 1
 
-  let profiling_prologue_size = 6
-
   let prologue_size f =
-    profiling_prologue_size
-      + (if initial_stack_offset f > 0 then 1 else 0)
-      + (if f.fun_contains_calls then 3 else 0)
+    if f.fun_frame_required then 4 else 0
 
   let tocload_size = 2
 
@@ -427,9 +433,13 @@ module BR = Branch_relaxation.Make (struct
     | Lop(Ispecific(Ipoll_far { return_label = None } )) -> 4
     | Lop(Iintop Imod) -> 3
     | Lop(Iintop(Icomp _)) -> 4
+    | Lop(Iintop(Icheckbound)) -> 2
+    | Lop(Ispecific(Icheckbound_far)) -> 3
     | Lop(Icompf _) -> 5
     | Lop(Iintop _) -> 1
     | Lop(Iintop_imm(Icomp _, _)) -> 4
+    | Lop(Iintop_imm(Icheckbound, _)) -> 2
+    | Lop(Ispecific(Icheckbound_imm_far _)) -> 3
     | Lop(Iintop_imm _) -> 1
     | Lop(Inegf | Iabsf | Iaddf | Isubf | Imulf | Idivf) -> 1
     | Lop(Ifloatofint) -> 9
@@ -464,11 +474,15 @@ module BR = Branch_relaxation.Make (struct
   let relax_poll ~return_label =
     Lop (Ispecific (Ipoll_far { return_label }))
 
+  let relax_intop_checkbound () =
+    Lop (Ispecific (Icheckbound_far))
+
+  let relax_intop_imm_checkbound ~bound =
+    Lop (Ispecific (Icheckbound_imm_far bound))
+
   (* [classify_addr], above, never identifies these instructions as needing
      relaxing.  As such, these functions should never be called. *)
   let relax_specific_op _ = assert false
-  let relax_intop_checkbound () = assert false
-  let relax_intop_imm_checkbound ~bound:_ = assert false
 end)
 
 (* Assembly code for inlined allocation *)
@@ -477,7 +491,7 @@ let emit_alloc env i bytes dbginfo far =
   if env.call_gc_label = 0 then env.call_gc_label <- new_label ();
   let offset = Domainstate.(idx_of_field Domain_young_limit) * 8 in
   `	ld	0, {emit_int offset}(30)\n`;
-  `	addi    31, 31, {emit_int(-bytes)}\n`;
+  `	addi	31, 31, {emit_int(-bytes)}\n`;
   `	cmpld	31, 0\n`;
   if not far then begin
     `	bltl-	{emit_label env.call_gc_label}\n`;
@@ -505,9 +519,9 @@ let emit_poll env i return_label far =
     end
     | Some return_label ->
       begin
-        ` bltl-  {emit_label env.call_gc_label}\n`;
+        `	bltl-	{emit_label env.call_gc_label}\n`;
         record_frame env i.live (Dbg_alloc []);
-        ` b   {emit_label return_label}\n`
+        `	b	{emit_label return_label}\n`
       end
     end;
   end else begin
@@ -515,11 +529,40 @@ let emit_poll env i return_label far =
     `	bge+	{emit_label lbl}\n`;
     `	bl	{emit_label env.call_gc_label}\n`;
     record_frame env i.live (Dbg_alloc []);
-    ` {emit_label lbl}:	\n`;
+    `{emit_label lbl}:	\n`;
     match return_label with
     | None ->   ()
-    | Some return_label -> ` b   {emit_label return_label}\n`
+    | Some return_label -> `	b	{emit_label return_label}\n`
   end
+
+let bound_error_label env dbg =
+  if !Clflags.debug then begin
+    let lbl_bound_error = new_label() in
+    let lbl_frame = record_frame_label env Reg.Set.empty (Dbg_other dbg) in
+    env.bound_error_sites <-
+      { bd_lbl = lbl_bound_error;
+        bd_frame = lbl_frame; } :: env.bound_error_sites;
+    lbl_bound_error
+  end else begin
+    match env.bound_error_call with
+    | None ->
+      let lbl = new_label() in
+      env.bound_error_call <- Some lbl;
+      lbl
+    | Some lbl -> lbl
+  end
+
+let emit_call_bound_error bd =
+  `{emit_label bd.bd_lbl}:`;  emit_call "caml_ml_array_bound_error";
+  `{emit_label bd.bd_frame}:`; emit_call_nop()
+
+let emit_call_bound_errors env =
+  List.iter emit_call_bound_error env.bound_error_sites;
+  match env.bound_error_call with
+  | None -> ()
+  | Some lbl ->
+    `{emit_label lbl}:`; emit_call "caml_ml_array_bound_error";
+    emit_call_nop()
 
 (* Output the assembly code for an instruction *)
 
@@ -528,13 +571,12 @@ let emit_instr env i =
     match i.desc with
     | Lend -> ()
     | Lprologue ->
-      assert (env.f.fun_prologue_required);
       let n = frame_size env in
       if n > 0 then begin
         `	addi	1, 1, {emit_int(-n)}\n`;
         cfi_adjust_cfa_offset n
       end;
-      if env.f.fun_contains_calls then begin
+      if env.f.fun_frame_required then begin
         let ra = retaddr_offset env in
         `	mflr	0\n`;
         `	std	0, {emit_int ra}(1)\n`;
@@ -619,7 +661,7 @@ let emit_instr env i =
     | Lop(Itailcall_ind) ->
         `	mtctr	{emit_reg i.arg.(0)}\n`;
         `	mr	12, {emit_reg i.arg.(0)}\n`;   (* addr of fn in r12 *)
-        if env.f.fun_contains_calls then begin
+        if env.f.fun_frame_required then begin
           `	ld	11, {emit_int(retaddr_offset env)}(1)\n`;
           `	mtlr	11\n`
         end;
@@ -631,7 +673,7 @@ let emit_instr env i =
         else begin
           emit_tocload emit_gpr 12 (TocSym func); (* addr of fn must be in r12 *)
           `	mtctr	12\n`;
-          if env.f.fun_contains_calls then begin
+          if env.f.fun_frame_required then begin
             `	ld	11, {emit_int(retaddr_offset env)}(1)\n`;
             `	mtlr	11\n`
           end;
@@ -734,9 +776,16 @@ let emit_instr env i =
         let (bitnum, negated) = emit_float_comp cmp i.arg in
         emit_extract_crbit bitnum negated i.res.(0)
     | Lop(Iintop (Icheckbound)) ->
-        if !Clflags.debug then
-          record_frame env Reg.Set.empty (Dbg_other i.dbg);
-        `	tdlle   {emit_reg i.arg.(0)}, {emit_reg i.arg.(1)}\n`
+        let lbl = bound_error_label env i.dbg in
+        `	cmpld	{emit_reg i.arg.(0)}, {emit_reg i.arg.(1)}\n`;
+        `	ble-	{emit_label lbl}\n`
+    | Lop(Ispecific (Icheckbound_far)) ->
+        let lbl_err = bound_error_label env i.dbg in
+        let lbl_next = new_label() in
+        `	cmpld	{emit_reg i.arg.(0)}, {emit_reg i.arg.(1)}\n`;
+        `	bgt+	{emit_label lbl_next}\n`;
+        `	b	{emit_label lbl_err}\n`;
+        `{emit_label lbl_next}:\n`
     | Lop(Iintop op) ->
         let instr = name_for_intop op in
         `	{emit_string instr}	{emit_reg i.res.(0)}, {emit_reg i.arg.(0)}, {emit_reg i.arg.(1)}\n`
@@ -752,9 +801,16 @@ let emit_instr env i =
             emit_set_comp c i.res.(0)
         end
     | Lop(Iintop_imm(Icheckbound, n)) ->
-        if !Clflags.debug then
-          record_frame env Reg.Set.empty (Dbg_other i.dbg);
-        `	tdllei	{emit_reg i.arg.(0)}, {emit_int n}\n`
+        let lbl = bound_error_label env i.dbg in
+        `	cmpldi	{emit_reg i.arg.(0)}, {emit_int n}\n`;
+        `	ble-	{emit_label lbl}\n`
+    | Lop(Ispecific(Icheckbound_imm_far n)) ->
+        let lbl_err = bound_error_label env i.dbg in
+        let lbl_next = new_label() in
+        `	cmpldi	{emit_reg i.arg.(0)}, {emit_int n}\n`;
+        `	bgt+	{emit_label lbl_next}\n`;
+        `	b	{emit_label lbl_err}\n`;
+        `{emit_label lbl_next}:\n`
     | Lop(Iintop_imm(op, n)) ->
         let instr = name_for_intop_imm op in
         `	{emit_string instr}	{emit_reg i.res.(0)}, {emit_reg i.arg.(0)}, {emit_int n}\n`
@@ -781,7 +837,7 @@ let emit_instr env i =
         `	{emit_string instr}	{emit_reg i.res.(0)}, {emit_reg i.arg.(0)}, {emit_reg i.arg.(1)}, {emit_reg i.arg.(2)}\n`
     | Lop (Idls_get) ->
         let offset = Domainstate.(idx_of_field Domain_dls_root) * 8 in
-        `	ld {emit_reg i.res.(0)}, {emit_int offset}(30)\n`
+        `	ld	{emit_reg i.res.(0)}, {emit_int offset}(30)\n`
     | Lop (Ireturn_addr) ->
         invalid_arg (
           "Support for Ireturn_addr is not implemented on architecture "
@@ -868,7 +924,7 @@ let emit_instr env i =
         adjust_stack_offset env trap_size;
         `	std	29, {emit_int reserved_stack_space}(1)\n`;
         emit_tocload emit_gpr 29 (TocLabel lbl_handler);
-        `	std     29, {emit_int (reserved_stack_space + 8)}(1)\n`;
+        `	std	29, {emit_int (reserved_stack_space + 8)}(1)\n`;
         `	addi	29, 1, {emit_int reserved_stack_space}\n`
     | Lpoptrap ->
         `	ld	29, {emit_int reserved_stack_space}(1)\n`;
@@ -887,7 +943,7 @@ let emit_instr env i =
         | Lambda.Raise_notrace ->
             `	ld	0, 8(29)\n`;
             `	addi	1, 29, {emit_int (trap_size - reserved_stack_space)}\n`;
-            `	mtctr   0\n`;
+            `	mtctr	0\n`;
             `	ld	29, {emit_int (reserved_stack_space - trap_size)}(1)\n`;
             `	bctr\n`
         end
@@ -899,6 +955,35 @@ let rec emit_all env i =
   | Lend -> ()
   |  _   -> emit_instr env i; emit_all env i.next
 
+(* On this target, the possible "out of line" code blocks are:
+   - a single "call GC" point, which comes immediately after the
+     function's body;
+   - zero, one or several "call bound error" point, which comes just after.
+*)
+
+let max_out_of_line_code_offset fundecl =
+  let rec num_checkbounds count instr =
+    match instr.desc with
+    | Lend -> count
+    | Lop (Iintop Icheckbound)
+    | Lop (Iintop_imm (Icheckbound, _)) ->
+        num_checkbounds (count + 1) instr.next
+    (* The following two should never be seen, since this function is run
+       before branch relaxation. *)
+    | Lop (Ispecific Icheckbound_far)
+    | Lop (Ispecific (Icheckbound_imm_far _)) -> assert false
+    | _ -> num_checkbounds count instr.next in
+  let num_chk = num_checkbounds 0 fundecl.fun_body in
+  (* This is what the end of the function looks like:
+        - offset 0: call GC point  (5 insn)
+        - offset 5: first (or only if not !Clflags.debug) call bound error
+                    (2 insns)
+        - offsets 7, 9, .. : second, third, ..., call bound error
+                    (2 insns each) *)
+  if num_chk = 0 then 0
+  else if !Clflags.debug then 5 + (num_chk - 1) * 2
+  else 5
+
 (* Emission of a function declaration *)
 
 let fundecl fundecl =
@@ -907,12 +992,10 @@ let fundecl fundecl =
   `	.align	2\n`;
   (* Dynamic stack checking *)
   let stack_threshold_size = Config.stack_threshold * 8 in (* bytes *)
-  let { max_frame_size; contains_nontail_calls} =
-    preproc_stack_check
-      ~fun_body:fundecl.fun_body ~frame_size:(frame_size env) ~trap_size:16
-  in
+  let max_frame_size = frame_size env + fundecl.fun_extra_stack_used in
   let handle_overflow = ref None in
-  if contains_nontail_calls || max_frame_size >= stack_threshold_size then begin
+  if fundecl.fun_contains_nontail_calls
+  || max_frame_size >= stack_threshold_size then begin
     let overflow = new_label () and ret = new_label () in
     (* The return address is saved in a register not used for param passing *)
     `{emit_label overflow}:	mflr	28\n`;
@@ -946,10 +1029,8 @@ let fundecl fundecl =
       `	ble-	{emit_label overflow}\n`;
       `{emit_label ret}:\n`
   end;
-  (* On this target, there is at most one "out of line" code block per
-     function: a single "call GC" point.  It comes immediately after the
-     function's body. *)
-  BR.relax fundecl ~max_out_of_line_code_offset:0;
+  BR.relax fundecl
+           ~max_out_of_line_code_offset: (max_out_of_line_code_offset fundecl);
   emit_all env fundecl.fun_body;
   (* Emit the glue code to call the GC *)
   if env.call_gc_label > 0 then begin
@@ -960,6 +1041,8 @@ let fundecl fundecl =
     `	mtctr	12\n`;
     `	bctr\n`
   end;
+  (* Emit the glue code to handle bound errors *)
+  emit_call_bound_errors env;
   cfi_endproc();
   `	.size	{emit_symbol fundecl.fun_name}, . - {emit_symbol fundecl.fun_name}\n`;
   (* Emit the numeric literals *)

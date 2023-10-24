@@ -1272,7 +1272,7 @@ let get_new_abstract_name env s =
   let index = Misc.find_first_mono check in
   name index
 
-let new_local_type ?(loc = Location.none) ?manifest_and_scope () =
+let new_local_type ?(loc = Location.none) ?manifest_and_scope origin =
   let manifest, expansion_scope =
     match manifest_and_scope with
       None -> None, Btype.lowest_level
@@ -1281,7 +1281,7 @@ let new_local_type ?(loc = Location.none) ?manifest_and_scope () =
   {
     type_params = [];
     type_arity = 0;
-    type_kind = Type_abstract Abstract_def;
+    type_kind = Type_abstract origin;
     type_private = Public;
     type_manifest = manifest;
     type_variance = [];
@@ -1295,10 +1295,16 @@ let new_local_type ?(loc = Location.none) ?manifest_and_scope () =
     type_uid = Uid.mk ~current_unit:(Env.get_unit_name ());
   }
 
-let existential_name cstr ty =
-  match get_desc ty with
-  | Tvar (Some name) -> "$" ^ cstr.cstr_name ^ "_'" ^ name
-  | _ -> "$" ^ cstr.cstr_name
+let existential_name name_counter ty =
+  let name =
+    match get_desc ty with
+    | Tvar (Some name) -> name
+    | _ ->
+        let name = Misc.letter_of_int !name_counter in
+        incr name_counter;
+        name
+  in
+  "$" ^ name
 
 type existential_treatment =
   | Keep_existentials_flexible
@@ -1306,6 +1312,7 @@ type existential_treatment =
 
 let instance_constructor existential_treatment cstr =
   For_copy.with_scope (fun copy_scope ->
+    let name_counter = ref 0 in
     let copy_existential =
       match existential_treatment with
       | Keep_existentials_flexible -> copy copy_scope
@@ -1313,8 +1320,8 @@ let instance_constructor existential_treatment cstr =
           fun existential ->
             let env = penv.env in
             let fresh_constr_scope = penv.equations_scope in
-            let decl = new_local_type () in
-            let name = existential_name cstr existential in
+            let decl = new_local_type (Existential cstr.cstr_name) in
+            let name = existential_name name_counter existential in
             let (id, new_env) =
               Env.enter_type (get_new_abstract_name env name) decl env
                 ~scope:fresh_constr_scope in
@@ -1472,7 +1479,7 @@ let copy_sep ~copy_scope ~fixed ~(visited : type_expr TypeHash.t) sch =
   List.iter Lazy.force !delayed_copies;
   ty
 
-let instance_poly' copy_scope ~keep_names fixed univars sch =
+let instance_poly' copy_scope ~keep_names ~fixed univars sch =
   (* In order to compute univars below, [sch] should not contain [Tsubst] *)
   let copy_var ty =
     match get_desc ty with
@@ -1485,17 +1492,17 @@ let instance_poly' copy_scope ~keep_names fixed univars sch =
   let ty = copy_sep ~copy_scope ~fixed ~visited sch in
   vars, ty
 
-let instance_poly ?(keep_names=false) fixed univars sch =
+let instance_poly ?(keep_names=false) ~fixed univars sch =
   For_copy.with_scope (fun copy_scope ->
-    instance_poly' copy_scope ~keep_names fixed univars sch
+    instance_poly' copy_scope ~keep_names ~fixed univars sch
   )
 
-let instance_label fixed lbl =
+let instance_label ~fixed lbl =
   For_copy.with_scope (fun copy_scope ->
     let vars, ty_arg =
       match get_desc lbl.lbl_arg with
         Tpoly (ty, tl) ->
-          instance_poly' copy_scope ~keep_names:false fixed tl ty
+          instance_poly' copy_scope ~keep_names:false ~fixed tl ty
       | _ ->
           [], copy copy_scope lbl.lbl_arg
     in
@@ -1938,14 +1945,12 @@ let local_non_recursive_abbrev uenv p ty =
 
 (* Since we cannot duplicate universal variables, unification must
    be done at meta-level, using bindings in univar_pairs *)
-(* TODO: use find_opt *)
 let rec unify_univar t1 t2 = function
     (cl1, cl2) :: rem ->
       let find_univ t cl =
-        try
-          let (_, r) = List.find (fun (t',_) -> eq_type t t') cl in
-          Some r
-        with Not_found -> None
+        List.find_map (fun (t', r) ->
+          if eq_type t t' then Some r else None
+        ) cl
       in
       begin match find_univ t1 cl1, find_univ t2 cl2 with
         Some {contents=Some t'2}, Some _ when eq_type t2 t'2 ->
@@ -2202,7 +2207,7 @@ let reify uenv t =
   let fresh_constr_scope = get_equations_scope uenv in
   let create_fresh_constr lev name =
     let name = match name with Some s -> "$'"^s | _ -> "$" in
-    let decl = new_local_type () in
+    let decl = new_local_type Definition in
     let env = get_env uenv in
     let new_name =
       (* unique names are needed only for error messages *)
@@ -2523,8 +2528,16 @@ let add_gadt_equation uenv source destination =
     let expansion_scope =
       Int.max (Path.scope source) (get_equations_scope uenv)
     in
+    let type_origin =
+      match Env.find_type source env with
+      | decl -> type_origin decl
+      | exception Not_found -> assert false
+    in
     let decl =
-      new_local_type ~manifest_and_scope:(destination, expansion_scope) () in
+      new_local_type
+        ~manifest_and_scope:(destination, expansion_scope)
+        type_origin
+    in
     set_env uenv (Env.add_local_type source decl env);
     cleanup_abbrev ()
   end
@@ -4302,9 +4315,9 @@ let rec equal_private env params1 ty1 params2 ty2 =
 type class_match_failure =
     CM_Virtual_class
   | CM_Parameter_arity_mismatch of int * int
-  | CM_Type_parameter_mismatch of Env.t * equality_error
+  | CM_Type_parameter_mismatch of int * Env.t * equality_error
   | CM_Class_type_mismatch of Env.t * class_type * class_type
-  | CM_Parameter_mismatch of Env.t * moregen_error
+  | CM_Parameter_mismatch of int * Env.t * moregen_error
   | CM_Val_type_mismatch of string * Env.t * comparison_error
   | CM_Meth_type_mismatch of string * Env.t * comparison_error
   | CM_Non_mutable_value of string
@@ -4372,20 +4385,24 @@ let match_class_sig_shape ~strict sign1 sign2 =
       else err)
     sign1.csig_vars errors
 
-let rec moregen_clty trace type_pairs env cty1 cty2 =
+(* [arrow_index] is the number of [Cty_arrow]
+           constructors we've seen so far. *)
+let rec moregen_clty ~arrow_index trace type_pairs env cty1 cty2 =
   try
     match cty1, cty2 with
     | Cty_constr (_, _, cty1), _ ->
-        moregen_clty true type_pairs env cty1 cty2
+        moregen_clty ~arrow_index true type_pairs env cty1 cty2
     | _, Cty_constr (_, _, cty2) ->
-        moregen_clty true type_pairs env cty1 cty2
+        moregen_clty ~arrow_index true type_pairs env cty1 cty2
     | Cty_arrow (l1, ty1, cty1'), Cty_arrow (l2, ty2, cty2') when l1 = l2 ->
+        let arrow_index = arrow_index + 1 in
         begin
           try moregen true type_pairs env ty1 ty2 with Moregen_trace trace ->
             raise (Failure [
-              CM_Parameter_mismatch (env, expand_to_moregen_error env trace)])
+                CM_Parameter_mismatch
+                  (arrow_index, env, expand_to_moregen_error env trace)])
         end;
-        moregen_clty false type_pairs env cty1' cty2'
+        moregen_clty ~arrow_index false type_pairs env cty1' cty2'
     | Cty_signature sign1, Cty_signature sign2 ->
         Meths.iter
           (fun lab (_, _, ty) ->
@@ -4428,6 +4445,9 @@ let rec moregen_clty trace type_pairs env cty1 cty2 =
   with
     Failure error when trace || error = [] ->
       raise (Failure (CM_Class_type_mismatch (env, cty1, cty2)::error))
+
+let moregen_clty trace type_pairs env cty1 cty2 =
+  moregen_clty ~arrow_index:0 trace type_pairs env cty1 cty2
 
 let match_class_types ?(trace=true) env pat_sch subj_sch =
   let sign1 = signature_of_class_type pat_sch in
@@ -4543,11 +4563,11 @@ let match_class_declarations env patt_params patt_type subj_params subj_type =
         let ls = List.length subj_params in
         if lp  <> ls then
           raise (Failure [CM_Parameter_arity_mismatch (lp, ls)]);
-        List.iter2 (fun p s ->
+        Stdlib.List.iteri2 (fun n p s ->
           try eqtype true type_pairs subst env p s with Equality_trace trace ->
             raise (Failure
                      [CM_Type_parameter_mismatch
-                        (env, expand_to_equality_error env trace !subst)]))
+                        (n+1, env, expand_to_equality_error env trace !subst)]))
           patt_params subj_params;
      (* old code: equal_clty false type_pairs subst env patt_type subj_type; *)
         equal_clsig false type_pairs subst env sign1 sign2;
@@ -4894,7 +4914,7 @@ let rec subtype_rec env trace t1 t2 cstrs =
     | (Tpoly (u1, []), Tpoly (u2, [])) ->
         subtype_rec env trace u1 u2 cstrs
     | (Tpoly (u1, tl1), Tpoly (u2, [])) ->
-        let _, u1' = instance_poly false tl1 u1 in
+        let _, u1' = instance_poly ~fixed:false tl1 u1 in
         subtype_rec env trace u1' u2 cstrs
     | (Tpoly (u1, tl1), Tpoly (u2,tl2)) ->
         begin try
@@ -5387,7 +5407,7 @@ let nondep_type_decl env mid is_covariant decl =
     let params = List.map (nondep_type_rec env mid) decl.type_params in
     let tk =
       try map_kind (nondep_type_rec env mid) decl.type_kind
-      with Nondep_cannot_erase _ when is_covariant -> Type_abstract Abstract_def
+      with Nondep_cannot_erase _ when is_covariant -> Type_abstract Definition
     and tm, priv =
       match decl.type_manifest with
       | None -> None, decl.type_private

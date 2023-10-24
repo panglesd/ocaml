@@ -67,7 +67,11 @@ struct caml_intern_state {
 
   unsigned char * intern_input;
   /* Pointer to beginning of block holding input data,
-    if non-NULL this pointer will be freed by the cleanup function. */
+    if non-NULL this pointer will be freed by the cleanup function.
+
+    Allocated using malloc/free instead of stat_alloc/stat_free to
+    satisfy the expectations of caml_input_value_from_malloc users.
+  */
 
   asize_t obj_counter;
   /* Count how many objects seen so far */
@@ -91,8 +95,14 @@ struct caml_intern_state {
   /* 1 if the compressed format is in use, 0 otherwise */
 };
 
-/* Allocates the domain local intern state if needed */
-static struct caml_intern_state* get_intern_state (void)
+static void init_intern_stack(struct caml_intern_state* s)
+{
+  /* (Re)initialize the globals for next time around */
+  s->intern_stack = s->intern_stack_init;
+  s->intern_stack_limit = s->intern_stack + INTERN_STACK_INIT_SIZE;
+}
+
+static struct caml_intern_state* init_intern_state (void)
 {
   Caml_check_caml_state();
   struct caml_intern_state* s;
@@ -106,25 +116,38 @@ static struct caml_intern_state* get_intern_state (void)
   s->intern_input = NULL;
   s->obj_counter = 0;
   s->intern_obj_table = NULL;
-  s->intern_stack = s->intern_stack_init;
-  s->intern_stack_limit = s->intern_stack + INTERN_STACK_INIT_SIZE;
   s->intern_dest = NULL;
+  init_intern_stack(s);
 
   Caml_state->intern_state = s;
   return s;
 }
 
+static struct caml_intern_state* get_intern_state (void)
+{
+  Caml_check_caml_state();
+
+  if (Caml_state->intern_state == NULL)
+    caml_fatal_error (
+      "intern_state not initialized: it is likely that a caml_deserialize_* "
+      "function was called without going through caml_input_*."
+      );
+
+  return Caml_state->intern_state;
+}
+
 void caml_free_intern_state (void)
 {
-  if (Caml_state->intern_state != NULL)
+  if (Caml_state->intern_state != NULL) {
     caml_stat_free(Caml_state->intern_state);
-  Caml_state->intern_state = NULL;
+    Caml_state->intern_state = NULL;
+  }
 }
 
 static char * intern_resolve_code_pointer(unsigned char digest[16],
                                           asize_t offset);
 
-static CAMLnoret void intern_bad_code_pointer(unsigned char digest[16]);
+CAMLnoret static void intern_bad_code_pointer(unsigned char digest[16]);
 
 Caml_inline unsigned char read8u(struct caml_intern_state* s)
 { return *s->intern_src++; }
@@ -220,16 +243,14 @@ static void intern_free_stack(struct caml_intern_state* s)
 {
   if (s->intern_stack != s->intern_stack_init) {
     caml_stat_free(s->intern_stack);
-    /* Reinitialize the globals for next time around */
-    s->intern_stack = s->intern_stack_init;
-    s->intern_stack_limit = s->intern_stack + INTERN_STACK_INIT_SIZE;
+    init_intern_stack(s);
   }
 }
 
 static void intern_cleanup(struct caml_intern_state* s)
 {
   if (s->intern_input != NULL) {
-     caml_stat_free(s->intern_input);
+     free(s->intern_input);
      s->intern_input = NULL;
   }
   if (s->intern_obj_table != NULL) {
@@ -259,7 +280,7 @@ static void readfloat(struct caml_intern_state* s,
 #else
   /* Host is neither big nor little; permute as appropriate */
   if (code == CODE_DOUBLE_LITTLE)
-    Permute_64(dest, ARCH_FLOAT_ENDIANNESS, dest, 0x01234567)
+    Permute_64(dest, ARCH_FLOAT_ENDIANNESS, dest, 0x01234567);
   else
     Permute_64(dest, ARCH_FLOAT_ENDIANNESS, dest, 0x76543210);
 #endif
@@ -301,7 +322,7 @@ static void readfloats(struct caml_intern_state* s,
 #endif
 }
 
-static CAMLnoret void intern_stack_overflow(struct caml_intern_state* s)
+CAMLnoret static void intern_stack_overflow(struct caml_intern_state* s)
 {
   caml_gc_message (0x04, "Stack overflow in un-marshaling value\n");
   intern_cleanup(s);
@@ -793,7 +814,7 @@ static void intern_decompress_input(struct caml_intern_state * s,
   s->compressed = h->compressed;
   if (! h->compressed) return;
 #ifdef HAS_ZSTD
-  unsigned char * blk = caml_stat_alloc_noexc(h->uncompressed_data_len);
+  unsigned char * blk = malloc(h->uncompressed_data_len);
   if (blk == NULL) {
     intern_cleanup(s);
     caml_raise_out_of_memory();
@@ -801,11 +822,11 @@ static void intern_decompress_input(struct caml_intern_state * s,
   size_t res =
     ZSTD_decompress(blk, h->uncompressed_data_len, s->intern_src, h->data_len);
   if (res != h->uncompressed_data_len) {
-    caml_stat_free(blk);
+    free(blk);
     intern_cleanup(s);
     intern_failwith2(fun_name, "decompression error");
   }
-  if (s->intern_input != NULL) caml_stat_free(s->intern_input);
+  if (s->intern_input != NULL) free(s->intern_input);
   s->intern_input = blk;  /* to be freed at end of demarshaling */
   s->intern_src = blk;
 #else
@@ -823,7 +844,7 @@ value caml_input_val(struct channel *chan)
   struct marshal_header h;
   char * block;
   value res;
-  struct caml_intern_state* s = get_intern_state ();
+  struct caml_intern_state* s = init_intern_state ();
 
   if (! caml_channel_binary_mode(chan))
     caml_failwith("input_value: not a binary channel");
@@ -855,9 +876,12 @@ value caml_input_val(struct channel *chan)
      can take place (via context switching in systhreads),
      and the context [s] may change.  So, wait until all I/O is over
      before using the context [s] again. */
-  block = caml_stat_alloc(h.data_len);
+  block = malloc(h.data_len);
+  if (block == NULL) {
+    caml_raise_out_of_memory();
+  }
   if (caml_really_getblock(chan, block, h.data_len) < h.data_len) {
-    caml_stat_free(block);
+    free(block);
     caml_failwith("input_value: truncated object");
   }
   /* Initialize global state */
@@ -875,9 +899,9 @@ CAMLprim value caml_input_value(value vchan)
   struct channel * chan = Channel(vchan);
   CAMLlocal1 (res);
 
-  Lock(chan);
+  caml_channel_lock(chan);
   res = caml_input_val(chan);
-  Unlock(chan);
+  caml_channel_unlock(chan);
   CAMLreturn (res);
 }
 
@@ -894,7 +918,7 @@ CAMLexport value caml_input_val_from_bytes(value str, intnat ofs)
   CAMLparam1 (str);
   CAMLlocal1 (obj);
   struct marshal_header h;
-  struct caml_intern_state* s = get_intern_state ();
+  struct caml_intern_state* s = init_intern_state ();
 
   /* Initialize global state */
   intern_init(s, &Byte_u(str, ofs), NULL);
@@ -932,7 +956,7 @@ static value input_val_from_block(struct caml_intern_state* s,
 CAMLexport value caml_input_value_from_malloc(char * data, intnat ofs)
 {
   struct marshal_header h;
-  struct caml_intern_state* s = get_intern_state ();
+  struct caml_intern_state* s = init_intern_state ();
 
   intern_init(s, data + ofs, data);
   caml_parse_header(s, "input_value_from_malloc", &h);
@@ -943,7 +967,7 @@ CAMLexport value caml_input_value_from_malloc(char * data, intnat ofs)
 CAMLexport value caml_input_value_from_block(const char * data, intnat len)
 {
   struct marshal_header h;
-  struct caml_intern_state* s = get_intern_state ();
+  struct caml_intern_state* s = init_intern_state ();
 
   /* Initialize global state */
   intern_init(s, data, NULL);
@@ -973,7 +997,7 @@ CAMLprim value caml_marshal_data_size(value buff, value ofs)
   uint32_t magic;
   int header_len;
   uintnat data_len;
-  struct caml_intern_state *s = get_intern_state ();
+  struct caml_intern_state *s = init_intern_state ();
 
   s->intern_src = &Byte_u(buff, Long_val(ofs));
   magic = read32u(s);

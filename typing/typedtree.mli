@@ -41,6 +41,10 @@ type _ pattern_category =
 | Value : value pattern_category
 | Computation : computation pattern_category
 
+type recursive_binding_kind =
+| Not_recursive
+| Static
+
 type pattern = value general_pattern
 and 'k general_pattern = 'k pattern_desc pattern_data
 
@@ -489,6 +493,7 @@ and value_binding =
   {
     vb_pat: pattern;
     vb_expr: expression;
+    vb_rec_kind: recursive_binding_kind;
     vb_attributes: attributes;
     vb_loc: Location.t;
   }
@@ -635,7 +640,7 @@ and core_type_desc =
   | Ttyp_constr of Path.t * Longident.t loc * core_type list
   | Ttyp_object of object_field list * closed_flag
   | Ttyp_class of Path.t * Longident.t loc * core_type list
-  | Ttyp_alias of core_type * string
+  | Ttyp_alias of core_type * string loc
   | Ttyp_variant of row_field list * closed_flag * label list option
   | Ttyp_poly of string list * core_type
   | Ttyp_package of package_type

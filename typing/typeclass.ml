@@ -779,7 +779,7 @@ let rec class_field_first_pass self_loc cl_num sign self_scope acc cf =
                    Ctype.unify val_env (Ctype.newty (Tpoly (ty', []))) ty;
                    Ctype.unify val_env (type_approx val_env sbody) ty'
                | Tpoly (ty1, tl) ->
-                   let _, ty1' = Ctype.instance_poly false tl ty1 in
+                   let _, ty1' = Ctype.instance_poly ~fixed:false tl ty1 in
                    let ty2 = type_approx val_env sbody in
                    Ctype.unify val_env ty2 ty1'
                | _ -> assert false
@@ -1342,8 +1342,9 @@ and class_expr_aux cl_num val_env met_env virt self_scope scl =
           ([], met_env)
       in
       let cl = class_expr cl_num val_env met_env virt self_scope scl' in
-      let () = if rec_flag = Recursive then
-        check_recursive_bindings val_env defs
+      let defs = match rec_flag with
+        | Recursive -> annotate_recursive_bindings val_env defs
+        | Nonrecursive -> defs
       in
       rc {cl_desc = Tcl_let (rec_flag, defs, vals, cl);
           cl_loc = scl.pcl_loc;
@@ -1447,7 +1448,7 @@ let temp_abbrev loc arity uid =
   let ty_td =
       {type_params = !params;
        type_arity = arity;
-       type_kind = Type_abstract Abstract_def;
+       type_kind = Type_abstract Definition;
        type_private = Public;
        type_manifest = Some ty;
        type_variance = Variance.unknown_signature ~injective:false ~arity;
@@ -1671,7 +1672,7 @@ let class_infos define_class kind
     {
      type_params = obj_params;
      type_arity = arity;
-     type_kind = Type_abstract Abstract_def;
+     type_kind = Type_abstract Definition;
      type_private = Public;
      type_manifest = Some obj_ty;
      type_variance = Variance.unknown_signature ~injective:false ~arity;
@@ -1973,7 +1974,7 @@ let approx_class sdecl =
 let approx_class_declarations env sdecls =
   let decls, env = class_type_declarations env (List.map approx_class sdecls) in
   List.iter (check_recmod_decl env) sdecls;
-  decls
+  decls, env
 
 (*******************************)
 
@@ -2173,8 +2174,11 @@ let report_error env ppf =
         "@[The instance variable is %s;@ it cannot be redefined as %s@]"
         mut1 mut2
   | No_overriding (_, "") ->
-      fprintf ppf "@[This inheritance does not override any methods@ %s@]"
-        "or instance variables"
+      fprintf ppf
+        "@[This inheritance does not override any methods@ \
+         or instance variables@ but is explicitly marked as@ \
+         overriding with %a.@]"
+        Style.inline_code "!"
   | No_overriding (kind, name) ->
       fprintf ppf "@[The %s %a@ has no previous definition@]" kind
         Style.inline_code name

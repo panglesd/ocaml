@@ -31,7 +31,8 @@ let lfunction params body =
   if params = [] then body else
   match body with
   | Lfunction {kind = Curried; params = params'; body = body'; attr; loc}
-    when List.length params + List.length params' <= Lambda.max_arity() ->
+    when attr.may_fuse_arity &&
+         List.length params + List.length params' <= Lambda.max_arity() ->
       lfunction ~kind:Curried ~params:(params @ params')
                 ~return:Pgenval
                 ~body:body'
@@ -666,7 +667,7 @@ let free_methods l =
     | Lmutlet(_k, id, _arg, _body) ->
         fv := Ident.Set.remove id !fv
     | Lletrec(decl, _body) ->
-        List.iter (fun (id, _exp) -> fv := Ident.Set.remove id !fv) decl
+        List.iter (fun { id } -> fv := Ident.Set.remove id !fv) decl
     | Lstaticcatch(_e1, (_,vars), _e2) ->
         List.iter (fun (id, _) -> fv := Ident.Set.remove id !fv) vars
     | Ltrywith(_e1, exn, _e2) ->

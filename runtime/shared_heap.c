@@ -17,7 +17,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-
+#include <assert.h>
 #include "caml/addrmap.h"
 #include "caml/custom.h"
 #include "caml/runtime_events.h"
@@ -48,14 +48,14 @@ typedef struct pool {
   caml_domain_state* owner;
   sizeclass sz;
 } pool;
-CAML_STATIC_ASSERT(sizeof(pool) == Bsize_wsize(POOL_HEADER_WSIZE));
+static_assert(sizeof(pool) == Bsize_wsize(POOL_HEADER_WSIZE), "");
 #define POOL_SLAB_WOFFSET(sz) (POOL_HEADER_WSIZE + wastage_sizeclass[sz])
 
 typedef struct large_alloc {
   caml_domain_state* owner;
   struct large_alloc* next;
 } large_alloc;
-CAML_STATIC_ASSERT(sizeof(large_alloc) % sizeof(value) == 0);
+static_assert(sizeof(large_alloc) % sizeof(value) == 0, "");
 #define LARGE_ALLOC_HEADER_SZ sizeof(large_alloc)
 
 static struct {
@@ -777,7 +777,7 @@ static void verify_object(struct heap_verify_state* st, value v) {
   }
 }
 
-void caml_verify_heap(caml_domain_state *domain) {
+void caml_verify_heap_from_stw(caml_domain_state *domain) {
   struct heap_verify_state* st = caml_verify_begin();
   caml_do_roots (&caml_verify_root, verify_scanning_flags, st, domain, 1);
   caml_scan_global_roots(&caml_verify_root, st);
@@ -882,7 +882,7 @@ static void verify_swept (struct caml_heap_state* local) {
   CAMLassert(local->stats.large_blocks == large_stats.live_blocks);
 }
 
-void caml_cycle_heap_stw (void) {
+void caml_cycle_heap_from_stw_single (void) {
   struct global_heap_state oldg = caml_global_heap_state;
   struct global_heap_state newg;
   newg.UNMARKED     = oldg.MARKED;

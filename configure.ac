@@ -55,11 +55,10 @@ oc_dll_ldflags=""
 oc_exe_ldflags=""
 
 tsan=false
-oc_tsan_cflags="-fsanitize=thread"
-
 # Passed to the linker by ocamlopt when tsan is enabled
-
+oc_tsan_cflags="-fsanitize=thread"
 oc_tsan_cppflags="-DWITH_THREAD_SANITIZER"
+tsan_distinguish_volatile_cflags=""
 
 # The C# compiler and its flags
 CSC=""
@@ -79,9 +78,8 @@ lib_systhreads=false
 lib_unix=false
 ocamltest_libunix=None
 ocamltest_unix_impl="dummy"
-ocamltest_unix_name=""
-ocamltest_unix_path=""
-ocamltest_unix_include=""
+unix_library=""
+unix_directory=""
 
 # Information about the package
 
@@ -119,6 +117,7 @@ AC_SUBST([S])
 AC_SUBST([runtime_asm_objects])
 AC_SUBST([SO])
 AC_SUBST([arch])
+AC_SUBST([arch_specific_SOURCES])
 AC_SUBST([arch64])
 AC_SUBST([model])
 AC_SUBST([system])
@@ -176,17 +175,17 @@ AC_SUBST([lib_systhreads])
 AC_SUBST([lib_unix])
 AC_SUBST([ocamltest_CPP])
 AC_SUBST([ocamltest_libunix])
-AC_SUBST([ocamltest_unix_impl])
-AC_SUBST([ocamltest_unix_name])
-AC_SUBST([ocamltest_unix_path])
-AC_SUBST([ocamltest_unix_include])
+AC_SUBST([unix_library])
+AC_SUBST([unix_directory])
 AC_SUBST([cc_has_debug_prefix_map])
 AC_SUBST([as_has_debug_prefix_map])
 AC_SUBST([with_debugger]) # TODO: rename this variable
 AC_SUBST([build_ocamldebug])
 AC_SUBST([build_ocamltex])
-AC_SUBST([ocamldoc])
 AC_SUBST([build_ocamldoc])
+AC_SUBST([ocamldoc_target])
+AC_SUBST([ocamldoc_opt_target])
+AC_SUBST([with_ocamldoc])
 AC_SUBST([documentation_tool])
 AC_SUBST([documentation_tool_cmd])
 AC_SUBST([ocamltest])
@@ -218,7 +217,7 @@ AC_SUBST([flexdll_chain])
 AC_SUBST([mkdll_ldflags_exp])
 AC_SUBST([mkexe_ldflags_exp])
 AC_SUBST([PACKLD])
-AC_SUBST([stdlib_manpages])
+AC_SUBST([build_libraries_manpages])
 AC_SUBST([compute_deps])
 AC_SUBST([ocaml_bindir])
 AC_SUBST([ocaml_libdir])
@@ -392,7 +391,7 @@ AC_ARG_ENABLE([ocamldoc],
   [AS_HELP_STRING([--disable-ocamldoc],
     [do not build the ocamldoc documentation system])],
   [],
-  [ocamldoc=auto])
+  [enable_ocamldoc='auto'])
 
 AC_ARG_WITH([odoc],
   [AS_HELP_STRING([--with-odoc],
@@ -472,7 +471,9 @@ AC_ARG_ENABLE([reserved-header-bits],
 
 AC_ARG_ENABLE([stdlib-manpages],
   [AS_HELP_STRING([--disable-stdlib-manpages],
-    [do not build or install the library man pages])])
+    [do not build or install the library man pages])],
+  [],
+  [enable_stdlib_manpages='auto'])
 
 AC_ARG_ENABLE([warn-error],
   [AS_HELP_STRING([--enable-warn-error],
@@ -528,6 +529,20 @@ AS_IF([test x"$enable_unix_lib" = "xno" || test x"$enable_str_lib" = "xno"],
     [enable_ocamldoc="no"
      build_ocamltex=false])],
   [build_ocamltex=true])
+
+AS_IF([test x"$enable_ocamldoc" = "xno"],
+  [AS_IF([test x"$enable_stdlib_manpages" = "xyes"],
+    [AC_MSG_ERROR([--enable-stdlib-manpages requires ocamldoc])])
+  ocamldoc_target=""
+  ocamldoc_opt_target=""
+  with_ocamldoc=""
+  enable_stdlib_manpages=no
+  build_ocamldoc=false],
+  [ocamldoc_target=ocamldoc
+  ocamldoc_opt_target=ocamldoc.opt
+  with_ocamldoc=ocamldoc
+  build_ocamldoc=true
+  AC_CONFIG_FILES([ocamldoc/META])])
 
 # Initialization of libtool
 # Allow the MSVC linker to be found even if ld isn't installed.
@@ -672,9 +687,8 @@ AS_IF([test x"$enable_unix_lib" != "xno"],
     otherlibs/unix/unix.ml:otherlibs/unix/unix_${unix_or_win32}.ml
   ])
   ocamltest_unix_impl="real"
-  ocamltest_unix_name="unix"
-  ocamltest_unix_path='$(ROOTDIR)/otherlibs/unix'
-  ocamltest_unix_include='-I $(ROOTDIR)/otherlibs/unix '],
+  unix_directory="otherlibs/unix"
+  unix_library="${unix_directory}/unix"],
   [ocamltest_libunix="None"])
 
 AS_IF([test x"$enable_str_lib" != "xno"],
@@ -739,6 +753,11 @@ AS_CASE([$ocaml_cv_cc_vendor],
   warn_error_flag='-Werror'
   cc_warnings="-Wall -Wint-conversion -Wstrict-prototypes \
 -Wold-style-definition"])
+
+# Use -Wold-style-declaration if supported
+AX_CHECK_COMPILE_FLAG([-Wold-style-declaration],
+  [cc_warnings="$cc_warnings -Wold-style-declaration"], [],
+  [$warn_error_flag])
 
 AS_CASE([$enable_warn_error,OCAML__DEVELOPMENT_VERSION],
   [yes,*|,true],
@@ -1235,13 +1254,19 @@ arch=none
 model=default
 system=unknown
 
+# In all the cases below, if $arch is set so then so too must $system,
+# preserving $arch = 'none' <=> $system = 'unknown'
 has_native_backend=no
 native_ldflags=""
 AS_CASE([$host],
   [[i[3456]86-*-linux*]],
-    [arch=i386; system=linux_elf],
-  [[i[3456]86-*-*bsd*]],
-    [arch=i386; system=bsd_elf],
+    [arch=i386; system=linux],
+  [[i[3456]86-*-freebsd*]],
+    [arch=i386; system=freebsd],
+  [[i[3456]86-*-netbsd*]],
+    [arch=i386; system=netbsd],
+  [[i[3456]86-*-openbsd*]],
+    [arch=i386; system=openbsd],
   [[i[3456]86-*-haiku*]],
     [arch=i386; system=beos],
   [[i[3456]86-*-cygwin]],
@@ -1255,24 +1280,26 @@ AS_CASE([$host],
   [x86_64-pc-windows],
     [arch=amd64; system=win64],
   [[powerpc64le*-*-linux*]],
-    [has_native_backend=yes; arch=power; model=ppc64le; system=elf],
+    [has_native_backend=yes; arch=power; model=ppc64le; system=linux],
+  [[powerpc64*-*-linux-musl*]],
+    [has_native_backend=yes; arch=power; model=ppc64; system=linux],
   [[s390x*-*-linux*]],
-    [has_native_backend=yes; arch=s390x; model=z10; system=elf],
+    [has_native_backend=yes; arch=s390x; model=z10; system=linux],
   # expected to match "gnueabihf" as well as "musleabihf"
   [armv6*-*-linux-*eabihf],
-    [arch=arm; model=armv6; system=linux_eabihf],
+    [arch=arm; model=armv6; system=linux],
   [armv7*-*-linux-*eabihf],
-    [arch=arm; model=armv7; system=linux_eabihf],
+    [arch=arm; model=armv7; system=linux],
   [armv8*-*-linux-*eabihf],
-    [arch=arm; model=armv8; system=linux_eabihf],
+    [arch=arm; model=armv8; system=linux],
   [armv8*-*-linux-*eabi],
-    [arch=arm; model=armv8; system=linux_eabi],
+    [arch=arm; model=armv8; system=linux],
   [armv7*-*-linux-*eabi],
-    [arch=arm; model=armv7; system=linux_eabi],
+    [arch=arm; model=armv7; system=linux],
   [armv6t2*-*-linux-*eabi],
-    [arch=arm; model=armv6t2; system=linux_eabi],
+    [arch=arm; model=armv6t2; system=linux],
   [armv6*-*-linux-*eabi],
-    [arch=arm; model=armv6; system=linux_eabi],
+    [arch=arm; model=armv6; system=linux],
   [armv6*-*-freebsd*],
     [arch=arm; model=armv6; system=freebsd],
   [earmv6*-*-netbsd*],
@@ -1280,17 +1307,17 @@ AS_CASE([$host],
   [earmv7*-*-netbsd*],
     [arch=arm; model=armv7; system=netbsd],
   [armv5te*-*-linux-*eabi],
-    [arch=arm; model=armv5te; system=linux_eabi],
+    [arch=arm; model=armv5te; system=linux],
   [armv5*-*-linux-*eabi],
-    [arch=arm; model=armv5; system=linux_eabi],
+    [arch=arm; model=armv5; system=linux],
   [arm*-*-linux-*eabihf],
-    [arch=arm; system=linux_eabihf],
+    [arch=arm; system=linux],
   [arm*-*-linux-*eabi],
-    [arch=arm; system=linux_eabi],
+    [arch=arm; system=linux],
   [arm*-*-openbsd*],
-    [arch=arm; system=bsd],
+    [arch=arm; system=openbsd],
   [zaurus*-*-openbsd*],
-    [arch=arm; system=bsd],
+    [arch=arm; system=openbsd],
   [x86_64-*-linux*],
     [has_native_backend=yes; arch=amd64; system=linux],
   [x86_64-*-gnu*],
@@ -1330,6 +1357,11 @@ AS_CASE([$host],
   [riscv64-*-linux*],
     [has_native_backend=yes; arch=riscv; model=riscv64; system=linux]
 )
+
+AS_CASE([$arch],
+  [amd64],
+    [arch_specific_SOURCES='$(intel_SOURCES)'],
+  [arch_specific_SOURCES=''])
 
 native_cflags=''
 native_cppflags="-DTARGET_${arch} -DMODEL_${model} -DSYS_${system}"
@@ -1655,9 +1687,15 @@ AS_IF([$tsan],
     [oc_tsan_cflags="$oc_tsan_cflags -Wno-tsan"])
   AS_CASE([$ocaml_cv_cc_vendor],
     [gcc*],
-    [oc_tsan_cflags="$oc_tsan_cflags --param=tsan-distinguish-volatile=1"],
+      [tsan_distinguish_volatile_cflags="--param=tsan-distinguish-volatile=1"],
     [clang*],
-    [oc_tsan_cflags="$oc_tsan_cflags -mllvm -tsan-distinguish-volatile"])
+      [tsan_distinguish_volatile_cflags="-mllvm -tsan-distinguish-volatile"])
+  AX_CHECK_COMPILE_FLAG([-fsanitize=thread $tsan_distinguish_volatile_cflags],
+    [],
+    [AC_MSG_ERROR(m4_normalize([The C compiler does not support the
+      `$tsan_distinguish_volatile_cflags' flag. Try upgrading to GCC >= 11, or
+      to Clang >= 11.]))], [$warn_error_flag])
+  oc_tsan_cflags="$oc_tsan_cflags $tsan_distinguish_volatile_cflags"
   common_cppflags="$common_cppflags $oc_tsan_cppflags"
   native_cflags="$native_cflags $oc_tsan_cflags"
   ocamlc_cflags="$ocamlc_cflags $oc_tsan_cflags"
@@ -2071,38 +2109,6 @@ AC_CHECK_HEADER([spawn.h],
   [AC_CHECK_FUNC([posix_spawn],
     [AC_CHECK_FUNC([posix_spawnp], [AC_DEFINE([HAS_POSIX_SPAWN])])])])
 
-## ffs or _BitScanForward
-
-AC_CHECK_FUNC([ffs], [AC_DEFINE([HAS_FFS])])
-AC_CHECK_FUNC([_BitScanForward], [AC_DEFINE([HAS_BITSCANFORWARD])])
-
-## pthread_getaffinity_np, args differ from GNU and BSD
-AC_MSG_CHECKING([arguments for pthread_getaffinity_np])
-AC_LINK_IFELSE(
-  [AC_LANG_PROGRAM(
-    [[#define _GNU_SOURCE
-      #include <sched.h>
-      #include <pthread.h>]],
-    [[cpu_set_t cs;
-      CPU_ZERO(&cs);
-      CPU_COUNT(&cs);
-      pthread_getaffinity_np(pthread_self(), sizeof(cs), &cs);]])],
-  [AC_MSG_RESULT([gnu])
-  AC_DEFINE([HAS_GNU_GETAFFINITY_NP])],
-  [AC_LINK_IFELSE(
-    [AC_LANG_PROGRAM(
-      [[#include <pthread.h>
-        #include <pthread_np.h>
-        #include <sys/cpuset.h>]],
-      [[cpuset_t cs;
-        /* Not every BSD has CPU_ZERO and CPU_COUNT (NetBSD) */
-        CPU_ZERO(&cs);
-        CPU_COUNT(&cs);
-        pthread_getaffinity_np(pthread_self(), sizeof(cs), &cs);]])],
-    [AC_MSG_RESULT([BSD])
-    AC_DEFINE([HAS_BSD_GETAFFINITY_NP])],
-    [AC_MSG_RESULT([pthread_getaffinity_np not found])])])
-
 AC_PATH_TOOL([PKG_CONFIG], [pkg-config], [false])
 
 ## ZSTD compression library
@@ -2171,15 +2177,44 @@ AS_CASE([$host],
     [PTHREAD_LIBS="-l:libpthread.lib"],
   [AX_PTHREAD(
     [common_cflags="$common_cflags $PTHREAD_CFLAGS"
-    saved_CFLAGS="$CFLAGS"
-    saved_LIBS="$LIBS"
+    # The two following lines add flags and libraries for pthread to the
+    # global CFLAGS and LIBS variables. This means that all the subsequent
+    # tests can rely on the assumption that pthread is enabled.
     CFLAGS="$CFLAGS $PTHREAD_CFLAGS"
     LIBS="$LIBS $PTHREAD_LIBS"
-    AC_CHECK_FUNC([sigwait], [AC_DEFINE([HAS_SIGWAIT])])
-    LIBS="$saved_LIBS"
-    CFLAGS="$saved_CFLAGS"],
+    AC_CHECK_FUNC([sigwait], [AC_DEFINE([HAS_SIGWAIT])])],
     [AC_MSG_ERROR(m4_normalize([POSIX threads are required but not supported on
       this platform]))])])
+
+## pthread_getaffinity_np, args differ from GNU and BSD
+AC_MSG_CHECKING([arguments for pthread_getaffinity_np])
+AC_LINK_IFELSE(
+  [AC_LANG_PROGRAM(
+    [[#define _GNU_SOURCE
+      #include <sched.h>
+      #ifdef HAS_PTHREAD_NP_H
+      #include <pthread_np.h>
+      #endif
+      #include <pthread.h>]],
+    [[cpu_set_t cs;
+      CPU_ZERO(&cs);
+      CPU_COUNT(&cs);
+      pthread_getaffinity_np(pthread_self(), sizeof(cs), &cs);]])],
+  [AC_MSG_RESULT([GNU])
+  AC_DEFINE([HAS_GNU_GETAFFINITY_NP])],
+  [AC_LINK_IFELSE(
+    [AC_LANG_PROGRAM(
+      [[#include <pthread.h>
+        #include <pthread_np.h>
+        #include <sys/cpuset.h>]],
+      [[cpuset_t cs;
+        /* Not every BSD has CPU_ZERO and CPU_COUNT (NetBSD) */
+        CPU_ZERO(&cs);
+        CPU_COUNT(&cs);
+        pthread_getaffinity_np(pthread_self(), sizeof(cs), &cs);]])],
+    [AC_MSG_RESULT([BSD])
+    AC_DEFINE([HAS_BSD_GETAFFINITY_NP])],
+    [AC_MSG_RESULT([pthread_getaffinity_np not found])])])
 
 ## Activate the systhread library
 
@@ -2232,12 +2267,8 @@ AS_IF([test x"$enable_installing_source_artifacts" = "xno"],
   [install_source_artifacts=false],
   [install_source_artifacts=true])
 
-AS_IF([test x"$enable_ocamldoc" = "xno"],
-  [ocamldoc=""
-  build_ocamldoc=false],
-  [ocamldoc=ocamldoc
-  build_ocamldoc=true
-  AC_CONFIG_FILES([ocamldoc/META])])
+AS_IF([test x"$enable_stdlib_manpages" != "xno"],
+  [build_libraries_manpages=true],[build_libraries_manpages=false])
 
 documentation_tool_cmd=''
 AC_ARG_WITH([odoc],
@@ -2258,7 +2289,11 @@ AS_CASE([$enable_ocamltest,OCAML__DEVELOPMENT_VERSION],
   [ocamltest=''])
 
 AS_IF([test -n "$ocamltest"],
-  [AC_CHECK_PROGS([DIFF], [patdiff diff], [none])
+  [ocamltest_unix_mod="ocamltest/ocamltest_unix_${ocamltest_unix_impl}.ml"
+  AC_CONFIG_LINKS([
+    ocamltest/ocamltest_unix.ml:${ocamltest_unix_mod}
+  ])
+  AC_CHECK_PROGS([DIFF], [patdiff diff], [none])
   DIFF_FLAGS=""
   flags=""
   AS_CASE([$DIFF],
@@ -2419,9 +2454,6 @@ AS_CASE([$host],
     # This is required as otherwise floats are printed
     # as "Infinity" and "Inf" instead of the expected "inf"
     [AC_DEFINE([HAS_BROKEN_PRINTF])])
-
-AS_IF([test x"$enable_stdlib_manpages" != "xno"],
-  [stdlib_manpages=true],[stdlib_manpages=false])
 
 # Do not permanently cache the result of flexdll.h
 unset ac_cv_header_flexdll_h

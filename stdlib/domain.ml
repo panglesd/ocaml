@@ -37,7 +37,7 @@ module Raw = struct
   external spawn : (unit -> 'a) -> 'a term_sync -> t
     = "caml_domain_spawn"
   external self : unit -> t
-    = "caml_ml_domain_id"
+    = "caml_ml_domain_id" [@@noalloc]
   external cpu_relax : unit -> unit
     = "caml_ml_domain_cpu_relax"
   external get_recommended_domain_count: unit -> int
@@ -177,10 +177,6 @@ let at_exit_key = DLS.new_key (fun () -> (fun () -> ()))
 let at_exit f =
   let old_exit : unit -> unit = DLS.get at_exit_key in
   let new_exit () =
-    (* The domain termination callbacks ([at_exit]) are run in
-       last-in-first-out (LIFO) order in order to be symmetric with the domain
-       creation callbacks ([at_each_spawn]) which run in first-in-fisrt-out
-       (FIFO) order. *)
     f (); old_exit ()
   in
   DLS.set at_exit_key new_exit

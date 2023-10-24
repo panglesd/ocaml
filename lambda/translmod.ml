@@ -121,7 +121,8 @@ and apply_coercion_result loc strict funct params args cc_res =
              ~return:Pgenval
              ~attr:{ default_function_attribute with
                         is_a_functor = true;
-                        stub = true; }
+                        stub = true;
+                        may_fuse_arity = true; }
              ~loc
              ~body:(apply_coercion
                    loc Strict cc_res
@@ -425,7 +426,8 @@ let transl_class_bindings ~scopes cl_list =
   (ids,
    List.map
      (fun ({ci_id_class=id; ci_expr=cl; ci_virt=vf}, meths) ->
-       (id, transl_class ~scopes ids id meths cl vf))
+       let def = transl_class ~scopes ids id meths cl vf in
+       { id; rkind = Static; def})
      cl_list)
 
 (* Compile one or more functors, merging curried functors to produce
@@ -499,6 +501,7 @@ let rec compile_functor ~scopes mexp coercion root_path loc =
       is_a_functor = true;
       stub = false;
       tmc_candidate = false;
+      may_fuse_arity = true;
     }
     ~loc
     ~body

@@ -34,10 +34,7 @@ let print_warning = Location.print_warning
 let input_name = Location.input_name
 
 let parse_mod_use_file name lb =
-  let modname =
-    String.capitalize_ascii
-      (Filename.remove_extension (Filename.basename name))
-  in
+  let modname = Unit_info.modname_from_source name in
   let items =
     List.concat
       (List.map
@@ -242,13 +239,15 @@ let read_input_default prompt buffer len =
 
 let read_interactive_input = ref read_input_default
 
+let comment_prompt_override = ref false
+
 let refill_lexbuf buffer len =
   if !got_eof then (got_eof := false; 0) else begin
     let prompt =
       if !Clflags.noprompt then ""
       else if !first_line then "# "
       else if !Clflags.nopromptcont then ""
-      else if Lexer.in_comment () then "* "
+      else if Lexer.in_comment () || !comment_prompt_override then "* "
       else "  "
     in
     first_line := false;
@@ -266,18 +265,23 @@ let set_paths ?(auto_include=Compmisc.auto_include) () =
      but keep the directories that user code linked in with ocamlmktop
      may have added to load_path. *)
   let expand = Misc.expand_directory Config.standard_library in
-  let current_load_path = Load_path.get_paths () in
-  let load_path = List.concat [
+  let Load_path.{ visible; hidden } = Load_path.get_paths () in
+  let visible = List.concat [
       [ "" ];
       List.map expand (List.rev !Compenv.first_include_dirs);
       List.map expand (List.rev !Clflags.include_dirs);
       List.map expand (List.rev !Compenv.last_include_dirs);
-      current_load_path;
+      visible;
       [expand "+camlp4"];
     ]
   in
-  Load_path.init ~auto_include load_path;
-  Dll.add_path load_path
+  let hidden = List.concat [
+      List.map expand (List.rev !Clflags.hidden_include_dirs);
+      hidden
+    ]
+  in
+  Load_path.init ~auto_include ~visible ~hidden;
+  Dll.add_path (visible @ hidden)
 
 let update_search_path_from_env () =
   let extra_paths =
@@ -402,7 +406,7 @@ let loading_hint_printer ppf cu =
   let global = Symtable.Global.Glob_compunit (Cmo_format.Compunit cu) in
   Symtable.report_error ppf (Symtable.Undefined_global global);
   let find_with_ext ext =
-    try Some (Load_path.find_uncap (cu ^ ext)) with Not_found -> None
+    try Some (Load_path.find_normalized (cu ^ ext)) with Not_found -> None
   in
   fprintf ppf
     "@.Hint: @[\

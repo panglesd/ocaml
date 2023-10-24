@@ -20,10 +20,12 @@
 
 #define _GNU_SOURCE  /* For sched.h CPU_ZERO(3) and CPU_COUNT(3) */
 #include "caml/config.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <string.h>
+#include <assert.h>
 #ifdef HAS_GNU_GETAFFINITY_NP
 #include <sched.h>
 #ifdef HAS_PTHREAD_NP_H
@@ -63,6 +65,13 @@ typedef cpuset_t cpu_set_t;
 #include "caml/startup.h"
 #include "caml/sync.h"
 #include "caml/weak.h"
+
+/* Check that the domain_state structure was laid out without padding,
+   since the runtime assumes this in computing offsets */
+static_assert(
+    offsetof(caml_domain_state, LAST_DOMAIN_STATE_MEMBER) ==
+    (Domain_state_num_fields - 1) * 8,
+    "");
 
 /* The runtime can run stop-the-world (STW) sections, during which all
    active domains run the same callback in parallel (with a barrier
@@ -141,7 +150,10 @@ typedef cpuset_t cpu_set_t;
 
 /* control of STW interrupts */
 struct interruptor {
-  atomic_uintnat* interrupt_word;
+  /* The outermost atomic is for synchronization with
+     caml_interrupt_all_signal_safe. The innermost atomic is also for
+     cross-domain communication.*/
+  _Atomic(atomic_uintnat *) interrupt_word;
   caml_plat_mutex lock;
   caml_plat_cond cond;
 
@@ -205,7 +217,7 @@ static caml_plat_mutex all_domains_lock = CAML_PLAT_MUTEX_INITIALIZER;
 static caml_plat_cond all_domains_cond =
     CAML_PLAT_COND_INITIALIZER(&all_domains_lock);
 static atomic_uintnat /* dom_internal* */ stw_leader = 0;
-static struct dom_internal all_domains[Max_domains];
+static dom_internal all_domains[Max_domains];
 
 CAMLexport atomic_uintnat caml_num_domains_running;
 
@@ -245,19 +257,22 @@ static struct {
   { 0 }
 };
 
-static void add_to_stw_domains(dom_internal* dom) {
-  int i;
+static void add_next_to_stw_domains(void)
+{
   CAMLassert(stw_domains.participating_domains < Max_domains);
-  for(i=stw_domains.participating_domains; stw_domains.domains[i]!=dom; ++i) {
-    CAMLassert(i<Max_domains);
-  }
-
-  /* swap passed domain with domain at stw_domains.participating_domains */
-  dom = stw_domains.domains[stw_domains.participating_domains];
-  stw_domains.domains[stw_domains.participating_domains] =
-      stw_domains.domains[i];
-  stw_domains.domains[i] = dom;
   stw_domains.participating_domains++;
+#ifdef DEBUG
+  /* Enforce here the invariant for early-exit in
+     [caml_interrupt_all_signal_safe], because the latter must be
+     async-signal-safe and one cannot CAMLassert inside it. */
+  bool prev_has_interrupt_word = true;
+  for (int i = 0; i < Max_domains; i++) {
+    bool has_interrupt_word = all_domains[i].interruptor.interrupt_word != NULL;
+    if (i < stw_domains.participating_domains) CAMLassert(has_interrupt_word);
+    if (!prev_has_interrupt_word) CAMLassert(!has_interrupt_word);
+    prev_has_interrupt_word = has_interrupt_word;
+  }
+#endif
 }
 
 static void remove_from_stw_domains(dom_internal* dom) {
@@ -294,7 +309,13 @@ CAMLexport caml_domain_state* caml_get_domain_state(void)
 
 Caml_inline void interrupt_domain(struct interruptor* s)
 {
-  atomic_store_release(s->interrupt_word, (uintnat)(-1));
+  atomic_uintnat * interrupt_word = atomic_load_relaxed(&s->interrupt_word);
+  atomic_store_release(interrupt_word, UINTNAT_MAX);
+}
+
+Caml_inline void interrupt_domain_local(caml_domain_state* dom_st)
+{
+  atomic_store_relaxed(&dom_st->young_limit, UINTNAT_MAX);
 }
 
 int caml_incoming_interrupts_queued(void)
@@ -585,8 +606,14 @@ static void domain_create(uintnat initial_minor_heap_wsize) {
 
   caml_state = domain_state;
 
+  domain_state->young_limit = 0;
+  /* Synchronized with [caml_interrupt_all_signal_safe], so that the
+     initializing write of young_limit happens before any
+     interrupt. */
+  atomic_store_explicit(&s->interrupt_word, &domain_state->young_limit,
+                        memory_order_release);
+
   s->unique_id = fresh_domain_unique_id();
-  s->interrupt_word = &domain_state->young_limit;
   s->running = 1;
   atomic_fetch_add(&caml_num_domains_running, 1);
 
@@ -650,7 +677,7 @@ static void domain_create(uintnat initial_minor_heap_wsize) {
   domain_state->c_stack = NULL;
   domain_state->exn_handler = NULL;
 
-  domain_state->action_pending = 0;
+  domain_state->action_pending = false;
 
   domain_state->gc_regs_buckets = NULL;
   domain_state->gc_regs = NULL;
@@ -687,7 +714,7 @@ static void domain_create(uintnat initial_minor_heap_wsize) {
 #endif
 
   caml_reset_young_limit(domain_state);
-  add_to_stw_domains(domain_self);
+  add_next_to_stw_domains();
   goto domain_init_complete;
 
 alloc_main_stack_failure:
@@ -734,7 +761,7 @@ CAMLexport void caml_reset_domain_lock(void)
 
 /* minor heap initialization and resizing */
 
-static void reserve_minor_heaps(void) {
+static void reserve_minor_heaps_from_stw_single(void) {
   void* heaps_base;
   uintnat minor_heap_reservation_bsize;
   uintnat minor_heap_max_bsz;
@@ -771,7 +798,7 @@ static void reserve_minor_heaps(void) {
   }
 }
 
-static void unreserve_minor_heaps(void) {
+static void unreserve_minor_heaps_from_stw_single(void) {
   uintnat size;
 
   caml_gc_log("unreserve_minor_heaps");
@@ -823,16 +850,16 @@ static void stw_resize_minor_heap_reservation(caml_domain_state* domain,
     caml_gc_log("stw_resize_minor_heap_reservation: "
                 "unreserve_minor_heaps");
 
-    unreserve_minor_heaps();
+    unreserve_minor_heaps_from_stw_single();
     /* new_minor_wsz is page-aligned because caml_norm_minor_heap_size has
        been called to normalize it earlier.
     */
     caml_minor_heap_max_wsz = new_minor_wsz;
     caml_gc_log("stw_resize_minor_heap_reservation: reserve_minor_heaps");
-    reserve_minor_heaps();
-    /* The call to [reserve_minor_heaps] makes a new reservation,
-       and it also updates the reservation boundaries of each domain
-       by mutating its [minor_heap_area_start{,_end}] variables.
+    reserve_minor_heaps_from_stw_single();
+    /* The call to [reserve_minor_heaps_from_stw_single] makes a new
+       reservation, and it also updates the reservation boundaries of each
+       domain by mutating its [minor_heap_area_start{,_end}] variables.
 
        These variables are synchronized by the fact that we are inside
        a STW section: no other domains are running in parallel, and
@@ -868,7 +895,9 @@ void caml_update_minor_heap_max(uintnat requested_wsz) {
 void caml_init_domains(uintnat minor_heap_wsz) {
   int i;
 
-  reserve_minor_heaps();
+  reserve_minor_heaps_from_stw_single();
+  /* stw_single: mutators and domains have not started yet. */
+
   for (i = 0; i < Max_domains; i++) {
     struct dom_internal* dom = &all_domains[i];
 
@@ -876,7 +905,7 @@ void caml_init_domains(uintnat minor_heap_wsz) {
 
     dom->id = i;
 
-    dom->interruptor.interrupt_word = 0;
+    dom->interruptor.interrupt_word = NULL;
     caml_plat_mutex_init(&dom->interruptor.lock);
     caml_plat_cond_init(&dom->interruptor.cond,
                         &dom->interruptor.lock);
@@ -944,10 +973,6 @@ struct domain_startup_params {
   struct domain_ml_values* ml_values; /* in */
   dom_internal* newdom; /* out */
   uintnat unique_id; /* out */
-#ifndef _WIN32
-  /* signal mask to set after it is safe to do so */
-  sigset_t* mask; /* in */
-#endif
 };
 
 static void* backup_thread_func(void* v)
@@ -1119,11 +1144,9 @@ static void* domain_thread_func(void* v)
 {
   struct domain_startup_params* p = v;
   struct domain_ml_values *ml_values = p->ml_values;
-#ifndef _WIN32
-  sigset_t mask = *(p->mask);
-  void * signal_stack;
 
-  signal_stack = caml_init_signal_stack();
+#ifndef _WIN32
+  void * signal_stack = caml_init_signal_stack();
   if (signal_stack == NULL) {
     caml_fatal_error("Failed to create domain: signal stack");
   }
@@ -1147,11 +1170,6 @@ static void* domain_thread_func(void* v)
 
   if (domain_self) {
     install_backup_thread(domain_self);
-
-#ifndef _WIN32
-    /* It is now safe for us to handle signals */
-    pthread_sigmask(SIG_SETMASK, &mask, NULL);
-#endif
 
     caml_gc_log("Domain starting (unique_id = %"ARCH_INTNAT_PRINTF_FORMAT"u)",
                 domain_self->interruptor.unique_id);
@@ -1201,9 +1219,6 @@ CAMLprim value caml_domain_spawn(value callback, value term_sync)
   struct domain_startup_params p;
   pthread_t th;
   int err;
-#ifndef _WIN32
-  sigset_t mask, old_mask;
-#endif
 
 #ifndef NATIVE_CODE
   if (caml_debugger_in_use)
@@ -1217,20 +1232,7 @@ CAMLprim value caml_domain_spawn(value callback, value term_sync)
                                     sizeof(struct domain_ml_values));
   init_domain_ml_values(p.ml_values, callback, term_sync);
 
-/* We block all signals while we spawn the new domain. This is because
-   pthread_create inherits the current signals set, and we want to avoid a
-   signal handler being triggered in the new domain before the domain_state is
-   fully populated. */
-#ifndef _WIN32
-  sigfillset(&mask);
-  pthread_sigmask(SIG_BLOCK, &mask, &old_mask);
-  p.mask = &old_mask;
-#endif
   err = pthread_create(&th, 0, domain_thread_func, (void*)&p);
-#ifndef _WIN32
-  /* We can restore the signal mask we had initially now. */
-  pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
-#endif
 
   if (err) {
     caml_failwith("failed to create domain thread");
@@ -1586,26 +1588,61 @@ int caml_try_run_on_all_domains_async(
                                                  leader_setup, 0, 0);
 }
 
-void caml_interrupt_self(void) {
-  interrupt_domain(&domain_self->interruptor);
+void caml_interrupt_self(void)
+{
+  interrupt_domain_local(Caml_state);
 }
 
+/* async-signal-safe */
+void caml_interrupt_all_signal_safe(void)
+{
+  for (dom_internal *d = all_domains; d < &all_domains[Max_domains]; d++) {
+    /* [all_domains] is an array of values. So we can access
+       [interrupt_word] directly without synchronisation other than
+       with other people who access the same [interrupt_word].*/
+    atomic_uintnat * interrupt_word =
+      atomic_load_acquire(&d->interruptor.interrupt_word);
+    /* Early exit: if the current domain was never initialized, then
+       neither have been any of the remaining ones. */
+    if (interrupt_word == NULL) return;
+    interrupt_domain(&d->interruptor);
+  }
+}
+
+/* To avoid any risk of forgetting an action through a race,
+   [caml_reset_young_limit] is the only way (apart from setting
+   young_limit to -1 for immediate interruption) through which
+   [young_limit] can be modified. We take care here of possible
+   races. */
 void caml_reset_young_limit(caml_domain_state * dom_st)
 {
   CAMLassert ((uintnat)dom_st->young_ptr > (uintnat)dom_st->young_trigger);
-  /* An interrupt might have been queued in the meanwhile; this
-     achieves the proper synchronisation. */
+  /* An interrupt might have been queued in the meanwhile; the
+     atomic_exchange achieves the proper synchronisation with the
+     reads that follow (an atomic_store is not enough). */
   atomic_exchange(&dom_st->young_limit, (uintnat)dom_st->young_trigger);
+  /* In case of actions that we never delay, interrupt the domain
+     again immediately. */
   dom_internal * d = &all_domains[dom_st->id];
   if (atomic_load_relaxed(&d->interruptor.interrupt_pending)
       || dom_st->requested_minor_gc
       || dom_st->requested_major_slice
       || dom_st->major_slice_epoch < atomic_load (&caml_major_slice_epoch)
-      || atomic_load_relaxed(&dom_st->requested_external_interrupt)
-      || dom_st->action_pending) {
-    atomic_store_release(&dom_st->young_limit, (uintnat)-1);
-    CAMLassert(caml_check_gc_interrupt(dom_st));
+      || atomic_load_relaxed(&dom_st->requested_external_interrupt)) {
+    interrupt_domain_local(dom_st);
   }
+  /* We might be here due to a recently-recorded signal, so we
+     need to remember that we must run signal handlers. In
+     addition, in the case of long-running C code (that may
+     regularly poll with caml_process_pending_actions), we want to
+     force a query of all callbacks at every minor collection or
+     major slice (similarly to the OCaml behaviour). */
+  caml_set_action_pending(dom_st);
+}
+
+void caml_update_young_limit_after_c_call(caml_domain_state * dom_st)
+{
+  if (CAMLunlikely(dom_st->action_pending)) interrupt_domain_local(dom_st);
 }
 
 Caml_inline void advance_global_major_slice_epoch (caml_domain_state* d)
@@ -1621,34 +1658,15 @@ Caml_inline void advance_global_major_slice_epoch (caml_domain_state* d)
   if (old_value != atomic_load (&caml_minor_collections_count)) {
     /* This domain is the first one to use up half of its minor heap arena
         in this minor cycle. Trigger major slice on other domains. */
-    if (caml_plat_try_lock(&all_domains_lock)) {
-      /* Note that this interrupt is best-effort. If we get the lock,
-         then interrupt all the domains. If not, either some other domain
-         is calling for a stop-the-world section interrupting all the
-         domains, or a domain is being created or terminated. All of these
-         actions also try to lock [all_domains_lock] mutex, and the above
-         lock acquisition may fail.
-
-         If we don't get the lock, we don't interrupt other domains. This is
-         acceptable since it does not affect safety but only liveness -- the
-         speed of the major gc. The other domains may themselves fill half of
-         their minor heap triggering a major slice, or will certainly do a
-         major slice right after their next minor GC when they observe that
-         their domain-local [Caml_state->major_slice_epoch] is less than the
-         global one [caml_major_slice_epoch]. */
-      for(int i = 0; i < stw_domains.participating_domains; i++) {
-        dom_internal * di = stw_domains.domains[i];
-        if (di->state != d) interrupt_domain(&di->interruptor);
-      }
-      caml_plat_unlock (&all_domains_lock);
-    }
+    caml_interrupt_all_signal_safe();
   }
 }
 
-static void global_major_slice_callback (caml_domain_state *domain,
-                                         void *unused,
-                                         int participating_count,
-                                         caml_domain_state **participating)
+static void stw_global_major_slice(
+  caml_domain_state *domain,
+  void *unused,
+  int participating_count,
+  caml_domain_state **participating)
 {
   domain->requested_major_slice = 1;
   /* Nothing else to do, as [stw_hander] will call [caml_poll_gc_work]
@@ -1703,7 +1721,7 @@ void caml_poll_gc_work(void)
 
   if (d->requested_global_major_slice) {
     if (caml_try_run_on_all_domains_async(
-          &global_major_slice_callback, NULL, NULL)){
+          &stw_global_major_slice, NULL, NULL)){
       d->requested_global_major_slice = 0;
     }
     /* If caml_try_run_on_all_domains_async fails, we'll try again next time
@@ -1828,10 +1846,18 @@ static void handover_finalisers(caml_domain_state* domain_state)
   caml_final_domain_terminate(domain_state);
 }
 
+static inline int domain_terminating(dom_internal *d) {
+  return d->interruptor.terminating;
+}
+
+int caml_domain_terminating (caml_domain_state *dom_st)
+{
+  return domain_terminating(&all_domains[dom_st->id]);
+}
+
 int caml_domain_is_terminating (void)
 {
-  struct interruptor* s = &domain_self->interruptor;
-  return s->terminating;
+  return domain_terminating(domain_self);
 }
 
 static void domain_terminate (void)
@@ -1839,18 +1865,9 @@ static void domain_terminate (void)
   caml_domain_state* domain_state = domain_self->state;
   struct interruptor* s = &domain_self->interruptor;
   int finished = 0;
-#ifndef _WIN32
-  sigset_t mask;
-#endif
 
   caml_gc_log("Domain terminating");
   s->terminating = 1;
-
-#ifndef _WIN32
-  /* Block all signals so that signal handlers do not run on this thread */
-  sigfillset(&mask);
-  pthread_sigmask(SIG_BLOCK, &mask, NULL);
-#endif
 
   /* Join ongoing systhreads, if necessary, and then run user-defined
      termination hooks. No OCaml code can run on this domain after
@@ -1923,13 +1940,13 @@ static void domain_terminate (void)
   domain_state->minor_tables = 0;
 
   caml_orphan_alloc_stats(domain_state);
-  /* Heap stats were orphaned by caml_teardown_shared_heap above.
-     At this point, the stats of the domain must be empty;
-     we also clear the sampled copy.
+  /* Heap stats were orphaned by [caml_teardown_shared_heap] above.
+     At this point, the stats of the domain must be empty.
 
-     Note: We cannot call caml_collect_gc_stats_sample to clear the
-     sample at this point as the shared heap is gone. */
-  caml_clear_gc_stats_sample(domain_state);
+     The sampled copy was also cleared by the minor collection(s)
+     performed above at [caml_empty_minor_heaps_once()], see the
+     termination-specific logic in [caml_collect_gc_stats_sample_stw].
+  */
 
   /* TODO: can this ever be NULL? can we remove this check? */
   if(domain_state->current_stack != NULL) {

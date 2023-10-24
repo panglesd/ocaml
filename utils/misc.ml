@@ -70,6 +70,13 @@ let rec map_end f l1 l2 =
     [] -> l2
   | hd::tl -> f hd :: map_end f tl l2
 
+let rev_map_end f l1 l2 =
+  let rec rmap_f accu = function
+    | [] -> accu
+    | hd::tl -> rmap_f (f hd :: accu) tl
+  in
+  rmap_f l2 l1
+
 let rec map_left_right f = function
     [] -> []
   | hd::tl -> let res = f hd in res :: map_left_right f tl
@@ -125,6 +132,14 @@ module Stdlib = struct
           aux (h :: acc) t1 t2
       in
       aux [] l1 l2
+
+    let rec iteri2 i f l1 l2 =
+      match (l1, l2) with
+        ([], []) -> ()
+      | (a1::l1, a2::l2) -> f i a1 a2; iteri2 (i + 1) f l1 l2
+      | (_, _) -> raise (Invalid_argument "iteri2")
+
+    let iteri2 f l1 l2 = iteri2 0 f l1 l2
 
     let some_if_all_elements_are_some l =
       let rec aux acc l =
@@ -275,8 +290,10 @@ let find_in_path_rel path name =
       if Sys.file_exists fullname then fullname else try_dir rem
   in try_dir path
 
-let find_in_path_uncap path name =
-  let uname = String.uncapitalize_ascii name in
+let normalized_unit_filename = String.uncapitalize_ascii
+
+let find_in_path_normalized path name =
+  let uname = normalized_unit_filename name in
   let rec try_dir = function
     [] -> raise Not_found
   | dir::rem ->
@@ -396,6 +413,12 @@ let no_overflow_mul a b =
 let no_overflow_lsl a k =
   0 <= k && k < Sys.word_size - 1 && min_int asr k <= a && a <= max_int asr k
 
+let letter_of_int n =
+  let letter = String.make 1 (Char.chr (Char.code 'a' + n mod 26)) in
+  let num = n / 26 in
+  if num = 0 then letter
+  else letter ^ Int.to_string num
+
 module Int_literal_converter = struct
   (* To convert integer literals, allowing max_int + 1 (PR#4210) *)
   let cvt_int_aux str neg of_string =
@@ -509,58 +532,6 @@ let fst4 (x, _, _, _) = x
 let snd4 (_,x,_, _) = x
 let thd4 (_,_,x,_) = x
 let for4 (_,_,_,x) = x
-
-
-module LongString = struct
-  type t = bytes array
-
-  let create str_size =
-    let tbl_size = str_size / Sys.max_string_length + 1 in
-    let tbl = Array.make tbl_size Bytes.empty in
-    for i = 0 to tbl_size - 2 do
-      tbl.(i) <- Bytes.create Sys.max_string_length;
-    done;
-    tbl.(tbl_size - 1) <- Bytes.create (str_size mod Sys.max_string_length);
-    tbl
-
-  let length tbl =
-    let tbl_size = Array.length tbl in
-    Sys.max_string_length * (tbl_size - 1) + Bytes.length tbl.(tbl_size - 1)
-
-  let get tbl ind =
-    Bytes.get tbl.(ind / Sys.max_string_length) (ind mod Sys.max_string_length)
-
-  let set tbl ind c =
-    Bytes.set tbl.(ind / Sys.max_string_length) (ind mod Sys.max_string_length)
-              c
-
-  let blit src srcoff dst dstoff len =
-    for i = 0 to len - 1 do
-      set dst (dstoff + i) (get src (srcoff + i))
-    done
-
-  let blit_string src srcoff dst dstoff len =
-    for i = 0 to len - 1 do
-      set dst (dstoff + i) (String.get src (srcoff + i))
-    done
-
-  let output oc tbl pos len =
-    for i = pos to pos + len - 1 do
-      output_char oc (get tbl i)
-    done
-
-  let input_bytes_into tbl ic len =
-    let count = ref len in
-    Array.iter (fun str ->
-      let chunk = Int.min !count (Bytes.length str) in
-      really_input ic str 0 chunk;
-      count := !count - chunk) tbl
-
-  let input_bytes ic len =
-    let tbl = create len in
-    input_bytes_into tbl ic len;
-    tbl
-end
 
 
 let cut_at s c =

@@ -78,7 +78,8 @@ CAMLdeprecated_typedef(addr, char *);
 /* Noreturn, CAMLnoreturn_start and CAMLnoreturn_end are preserved
    for compatibility reasons.  Instead, we recommend using the CAMLnoret
    macro, to be added as a modifier at the beginning of the
-   function definition or declaration.
+   function definition or declaration.  It must occur first, before
+   "static", "extern", "CAMLexport", "CAMLextern".
 
    Note: CAMLnoreturn is a different macro defined in memory.h,
    to be used in function bodies rather than as a function attribute.
@@ -215,14 +216,6 @@ Caml_inline void call_timing_hook(_Atomic caml_timing_hook * a)
 
 #endif /* CAML_INTERNALS */
 
-#define CAML_STATIC_ASSERT_3(b, l) \
-  CAMLunused_start \
-    CAMLextern char static_assertion_failure_line_##l[(b) ? 1 : -1] \
-  CAMLunused_end
-
-#define CAML_STATIC_ASSERT_2(b, l) CAML_STATIC_ASSERT_3(b, l)
-#define CAML_STATIC_ASSERT(b) CAML_STATIC_ASSERT_2(b, __LINE__)
-
 /* Windows Unicode support (rest below - char_os is needed earlier) */
 
 #ifdef _WIN32
@@ -248,7 +241,7 @@ typedef char char_os;
 
 #define CAMLassert(x) \
   (CAMLlikely(x) ? (void) 0 : caml_failed_assert ( #x , __OSFILE__, __LINE__))
-CAMLextern CAMLnoret void caml_failed_assert (char *, char_os *, int);
+CAMLnoret CAMLextern void caml_failed_assert (char *, char_os *, int);
 #else
 #define CAMLassert(x) ((void) 0)
 #endif
@@ -299,7 +292,7 @@ typedef void (*fatal_error_hook) (char *msg, va_list args);
 extern _Atomic fatal_error_hook caml_fatal_error_hook;
 #endif
 
-CAMLextern CAMLnoret void caml_fatal_error (char *, ...)
+CAMLnoret CAMLextern void caml_fatal_error (char *, ...)
 #ifdef __GNUC__
   __attribute__ ((format (printf, 1, 2)))
 #endif

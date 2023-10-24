@@ -77,6 +77,9 @@ val reraise_preserving_backtrace : exn -> (unit -> unit) -> 'a
 val map_end: ('a -> 'b) -> 'a list -> 'b list -> 'b list
        (** [map_end f l t] is [map f l @ t], just more efficient. *)
 
+val rev_map_end: ('a -> 'b) -> 'a list -> 'b list -> 'b list
+       (** [map_end f l t] is [map f (rev l) @ t], just more efficient. *)
+
 val map_left_right: ('a -> 'b) -> 'a list -> 'b list
        (** Like [List.map], with guaranteed left-to-right evaluation order *)
 
@@ -127,6 +130,10 @@ module Stdlib : sig
     (** [let r1, r2 = map2_prefix f l1 l2]
         If [l1] is of length n and [l2 = h2 @ t2] with h2 of length n,
         r1 is [List.map2 f l1 h1] and r2 is t2. *)
+
+    val iteri2 : (int -> 'a -> 'b -> unit) -> 'a list -> 'b list -> unit
+    (** Same as {!List.iter2}, but the function is applied to the index of
+        the element as first argument (counting from 0) *)
 
     val split_at : int -> 'a t -> 'a t * 'a t
     (** [split_at n l] returns the pair [before, after] where [before] is
@@ -210,10 +217,13 @@ val find_in_path: string list -> string -> string
 val find_in_path_rel: string list -> string -> string
        (** Search a relative file in a list of directories. *)
 
-val find_in_path_uncap: string list -> string -> string
-       (** Same, but search also for uncapitalized name, i.e.
-           if name is [Foo.ml], allow [/path/Foo.ml] and [/path/foo.ml]
-           to match. *)
+ (** Normalize file name [Foo.ml] to [foo.ml] *)
+val normalized_unit_filename: string -> string
+
+val find_in_path_normalized: string list -> string -> string
+(** Same as {!find_in_path_rel} , but search also for normalized unit filename,
+    i.e. if name is [Foo.ml], allow [/path/Foo.ml] and [/path/foo.ml] to
+    match. *)
 
 val remove_file: string -> unit
        (** Delete the given file if it exists and is a regular file.
@@ -303,6 +313,8 @@ val no_overflow_mul: int -> int -> bool
 val no_overflow_lsl: int -> int -> bool
        (** [no_overflow_lsl n k] returns [true] if the computation of
            [n lsl k] does not overflow. *)
+
+val letter_of_int : int -> string
 
 module Int_literal_converter : sig
   val int : string -> int
@@ -412,25 +424,6 @@ val fst4: 'a * 'b * 'c * 'd -> 'a
 val snd4: 'a * 'b * 'c * 'd -> 'b
 val thd4: 'a * 'b * 'c * 'd -> 'c
 val for4: 'a * 'b * 'c * 'd -> 'd
-
-(** {1 Long strings} *)
-
-(** ``Long strings'' are mutable arrays of characters that are not limited
-    in length to {!Sys.max_string_length}. *)
-
-module LongString :
-  sig
-    type t = bytes array
-    val create : int -> t
-    val length : t -> int
-    val get : t -> int -> char
-    val set : t -> int -> char -> unit
-    val blit : t -> int -> t -> int -> int -> unit
-    val blit_string : string -> int -> t -> int -> int -> unit
-    val output : out_channel -> t -> int -> int -> unit
-    val input_bytes_into : t -> in_channel -> int -> unit
-    val input_bytes : in_channel -> int -> t
-  end
 
 (** {1 Spell checking and ``did you mean'' suggestions} *)
 

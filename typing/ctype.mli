@@ -173,8 +173,8 @@ val instance_list: type_expr list -> type_expr list
         (* Take an instance of a list of type schemes *)
 val new_local_type:
         ?loc:Location.t ->
-        ?manifest_and_scope:(type_expr * int) -> unit -> type_declaration
-val existential_name: constructor_description -> type_expr -> string
+        ?manifest_and_scope:(type_expr * int) ->
+        type_origin -> type_declaration
 
 module Pattern_env : sig
   type t = private
@@ -206,12 +206,13 @@ val instance_class:
         type_expr list -> class_type -> type_expr list * class_type
 
 val instance_poly:
-        ?keep_names:bool ->
-        bool -> type_expr list -> type_expr -> type_expr list * type_expr
+        ?keep_names:bool -> fixed:bool ->
+        type_expr list -> type_expr -> type_expr list * type_expr
         (* Take an instance of a type scheme containing free univars *)
 val polyfy: Env.t -> type_expr -> type_expr list -> type_expr * bool
 val instance_label:
-        bool -> label_description -> type_expr list * type_expr * type_expr
+        fixed:bool ->
+        label_description -> type_expr list * type_expr * type_expr
         (* Same, for a label *)
 val apply:
         ?use_current_level:bool ->
@@ -319,9 +320,9 @@ exception Filter_method_failed of filter_method_failure
 type class_match_failure =
     CM_Virtual_class
   | CM_Parameter_arity_mismatch of int * int
-  | CM_Type_parameter_mismatch of Env.t * Errortrace.equality_error
+  | CM_Type_parameter_mismatch of int * Env.t * Errortrace.equality_error
   | CM_Class_type_mismatch of Env.t * class_type * class_type
-  | CM_Parameter_mismatch of Env.t * Errortrace.moregen_error
+  | CM_Parameter_mismatch of int * Env.t * Errortrace.moregen_error
   | CM_Val_type_mismatch of string * Env.t * Errortrace.comparison_error
   | CM_Meth_type_mismatch of string * Env.t * Errortrace.comparison_error
   | CM_Non_mutable_value of string

@@ -252,8 +252,7 @@ work locally) by pinning:
 
 ----
 opam switch create my-switch-name --empty
-# Replace $VERSION by the trunk version
-opam pin add ocaml-variants.$VERSION+branch git+https://$REPO#branch
+opam pin add ocaml-variants git+https://$REPO#branch
 ----
 
 ==== Incremental builds with `opam`
@@ -399,6 +398,8 @@ installation, the following targets may be of use:
 
 `make runtop` :: builds and runs the ocaml toplevel of the distribution
                           (optionally uses `rlwrap` for readline+history support)
+                          (use `make runtop-with-otherlibs` if you need `Unix` or other
+                           `otherlibs/` libraries)
 `make natruntop`:: builds and runs the native ocaml toplevel (experimental)
 
 `make partialclean`:: Clean the OCaml files but keep the compiled C files.
@@ -553,7 +554,7 @@ machine, you can use the configuration values and run command taken from
 link:tools/ci/actions/runner.sh[]:
 
 ----
-XARCH=x64 bash -ex tools/ci/actions/runner.sh configure
+bash -ex tools/ci/actions/runner.sh configure
 ----
 
 The link:.github/workflows/hygiene.yml[] script supports other kinds of
